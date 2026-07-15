@@ -27,13 +27,15 @@ from starlette.middleware import Middleware as StarletteMiddleware
 
 from validators import (
     AGGREGATION_BY_VALUES,
+    CLUSTERING_CUTOFF_DATE,
+    CLUSTERING_CUTOFF_PREV_DATE,
     CLUSTERING_VARIABLE_VALUES,
     NEWS_DOMAIN_TYPE_VALUES,
     SORT_BY_VALUES,
+    clustering_straddles_cutoff,
     flatten_custom_tags,
     lint_query,
     validate_choice,
-    validate_clustering_date_range,
     validate_clustering_threshold,
     validate_ids_or_links,
     validate_page_params,
@@ -53,7 +55,7 @@ session_api_token: contextvars.ContextVar[str] = contextvars.ContextVar("session
 _session_api_tokens: dict[str, str] = {}
 
 # API Configuration
-API_BASE_URL = "https://v3-api.newscatcherapi.com"
+API_BASE_URL = os.getenv("NEWS_API_BASE_URL") or "https://v3-api.newscatcherapi.com"
 
 
 class ApiTokenASGIMiddleware:
@@ -156,7 +158,8 @@ on any of these to opt out.
   one page at a time, so raise `page_size` to at least your expected result count for coherent clusters.
 - `clustering_variable` is deprecated (ignored) for articles published on/after 2026-01-01 — since
   results default to the last 7 days, this is already inert for most default-range calls today.
-  Clustering cannot be used across a date range that straddles 2026-01-01 — the API rejects it.
+  The API cannot cluster across a date range that straddles 2026-01-01; when that happens
+  `search_articles` splits the range at the boundary, clusters each half, and merges the result.
 
 ## Pagination and the 10,000-result cap
 - `page_size` maxes out at 1000; there is a hard cap of 10,000 articles per query regardless of pagination.
@@ -374,6 +377,84 @@ def _add_list_field(body: dict[str, Any], key: str, value: list[str] | None) -> 
         body[key] = value
 
 
+def _project_result(result: Any, fields: list[str] | None) -> Any:
+    """Opt-in output projection. When `fields` is provided, trim every returned
+    article -- both a top-level `articles` list and articles nested under
+    `clusters` -- to just those top-level keys. No-op when `fields` is None.
+
+    News API v3 returns ~40 fields per article (plus large `all_links` /
+    `all_domain_links` / `nlp` structures), which can blow an agent's context on a
+    single call. This lets a caller ask for only what it needs (e.g.
+    fields=["title","link","published_date","domain_url","summary"]) without
+    changing behaviour for callers that don't pass it.
+    """
+    if not fields or not isinstance(result, dict):
+        return result
+    keep = set(fields)
+
+    def proj(a: Any) -> Any:
+        return {k: v for k, v in a.items() if k in keep} if isinstance(a, dict) else a
+
+    if isinstance(result.get("articles"), list):
+        result["articles"] = [proj(a) for a in result["articles"]]
+    if isinstance(result.get("clusters"), list):
+        for c in result["clusters"]:
+            if isinstance(c, dict) and isinstance(c.get("articles"), list):
+                c["articles"] = [proj(a) for a in c["articles"]]
+    return result
+
+
+def build_source(fields: list[str] | None, clustered: bool) -> str | None:
+    """Turn a caller's list of article field names into the News API `_source`
+    value: a comma-separated string of dotted paths that trims the response
+    SERVER-SIDE (so the ~40 fields/article, incl. the large `content` body, never
+    cross the wire). Returns None when fields is None (no projection).
+
+    The path prefix depends on the response shape, which the API is strict about:
+    a flat result nests articles under `articles.*`; a clustered result nests them
+    under `clusters.articles.*` (and using the wrong prefix silently drops the whole
+    articles/clusters payload). A few structural top-level keys are always kept.
+    """
+    if not fields:
+        return None
+    if clustered:
+        top = ["total_hits", "page", "page_size", "clusters_count",
+               "clusters.cluster_id", "clusters.cluster_size"]
+        prefix = "clusters.articles."
+    else:
+        top = ["total_hits", "page", "page_size", "total_pages"]
+        prefix = "articles."
+    return ",".join(top + [prefix + f for f in fields])
+
+
+async def _search_clustered_across_cutoff(api_token: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Clustering can't span the 2026-01-01 boundary (the API 422s). When a clustered
+    search's date range straddles it, run the two halves -- each entirely on one side,
+    so each is a legal clustered request -- and merge into one clustered response.
+    This follows the API's own rule ("keep the range entirely before or on/after
+    2026-01-01") while preserving clustering for the caller's full range.
+    """
+    before = {**body, "to_": CLUSTERING_CUTOFF_PREV_DATE}   # [from_ .. 2025-12-31]
+    after = {**body, "from_": CLUSTERING_CUTOFF_DATE}        # [2026-01-01 .. to_]
+    ra = await make_api_request(api_token=api_token, path="/api/search", json_data=before)
+    rb = await make_api_request(api_token=api_token, path="/api/search", json_data=after)
+    return {
+        "status": "ok",
+        "total_hits": (ra.get("total_hits") or 0) + (rb.get("total_hits") or 0),
+        "clusters_count": (ra.get("clusters_count") or 0) + (rb.get("clusters_count") or 0),
+        "clusters": (ra.get("clusters") or []) + (rb.get("clusters") or []),
+        "page": body.get("page", 1),
+        "page_size": body.get("page_size"),
+        "date_range_split": {
+            "reason": "clustering cannot span 2026-01-01; range was split at the boundary and results merged",
+            "before": {"from_": body.get("from_"), "to_": CLUSTERING_CUTOFF_PREV_DATE,
+                       "clusters_count": ra.get("clusters_count"), "total_hits": ra.get("total_hits")},
+            "after": {"from_": CLUSTERING_CUTOFF_DATE, "to_": body.get("to_"),
+                      "clusters_count": rb.get("clusters_count"), "total_hits": rb.get("total_hits")},
+        },
+    }
+
+
 # --- Tools -------------------------------------------------------------------
 
 
@@ -433,6 +514,7 @@ async def search_articles(
     custom_tags: dict[str, list[str]] | None = None,
     exclude_duplicates: bool | None = True,
     robots_compliant: bool | None = None,
+    fields: list[str] | None = None,
 ) -> str:
     """
     Full-text/boolean keyword search over global news articles. The richest tool
@@ -447,12 +529,20 @@ async def search_articles(
     - clustering_enabled, exclude_duplicates, and include_nlp_data all default to
       true for richer, deduplicated, NLP-enriched results -- pass false to opt out
       of any of them. clustering_enabled changes the response shape (see Returns).
+    - fields: pass a list of article keys (e.g. ["title","link","published_date",
+      "domain_url","summary","nlp"]) to trim each returned article to just those --
+      News API v3 returns ~40 fields per article (the biggest being the large
+      all_links/all_domain_links/all_links_text arrays), so this keeps large,
+      enriched result sets within an agent's context budget. Omit for full objects.
     - Hard cap: 10,000 matched articles per query regardless of pagination. Call
       get_aggregation_count first on broad/undated queries to measure actual volume
       and time-chunk the date range accordingly (denser topics need hourly chunks,
       sparse ones can use a month -- see this server's instructions for the sizing
       table and the full clustering/deduplication guidance).
-    - Clustering cannot span a date range straddling 2026-01-01.
+    - If a clustered search's date range straddles 2026-01-01 (which the API cannot
+      cluster across), this tool automatically splits it at the boundary, runs each
+      half clustered, and merges the result (adds a `date_range_split` note). You do
+      not need to split the range yourself.
 
     Args:
         q: Boolean/keyword query. Supports AND/OR/NOT, +term/-term, exact phrases
@@ -582,7 +672,8 @@ async def search_articles(
         validate_sentiment_range(title_sentiment_max, "title_sentiment_max")
         validate_sentiment_range(content_sentiment_min, "content_sentiment_min")
         validate_sentiment_range(content_sentiment_max, "content_sentiment_max")
-        validate_clustering_date_range(clustering_enabled, from_, to_)
+        # NB: a clustered range straddling 2026-01-01 is handled below by splitting at
+        # the boundary (not rejected), so we intentionally do NOT pre-raise here.
 
         body: dict[str, Any] = {"q": q, "page": page, "page_size": page_size}
         _add_list_field(body, "search_in", search_in)
@@ -636,7 +727,14 @@ async def search_articles(
         _add_field(body, "exclude_duplicates", exclude_duplicates)
         _add_field(body, "robots_compliant", robots_compliant)
 
-        result = await make_api_request(api_token=api_token, path="/api/search", json_data=body)
+        clustered = body.get("clustering_enabled") is True
+        source = build_source(fields, clustered)
+        if source is not None:
+            body["_source"] = source  # server-side field trim; inherited by both split halves
+        if clustered and clustering_straddles_cutoff(from_, to_):
+            result = await _search_clustered_across_cutoff(api_token, body)
+        else:
+            result = await make_api_request(api_token=api_token, path="/api/search", json_data=body)
         return json.dumps(result, indent=2)
     except ValueError as e:
         return f"Error: {str(e)}"
@@ -688,6 +786,7 @@ async def get_latest_headlines(
     content_sentiment_max: float | None = None,
     custom_tags: dict[str, list[str]] | None = None,
     robots_compliant: bool | None = None,
+    fields: list[str] | None = None,
 ) -> str:
     """
     Recent headlines over a rolling time window -- no keyword query required.
@@ -822,6 +921,9 @@ async def get_latest_headlines(
         body.update(flatten_custom_tags(custom_tags))
         _add_field(body, "robots_compliant", robots_compliant)
 
+        source = build_source(fields, body.get("clustering_enabled") is True)
+        if source is not None:
+            body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/latest_headlines", json_data=body)
         return json.dumps(result, indent=2)
     except ValueError as e:
@@ -853,6 +955,7 @@ async def get_breaking_news(
     title_sentiment_max: float | None = None,
     content_sentiment_min: float | None = None,
     content_sentiment_max: float | None = None,
+    fields: list[str] | None = None,
 ) -> str:
     """
     Actively-trending news event clusters, ordered by how heavily each is covered.
@@ -944,7 +1047,7 @@ async def get_breaking_news(
         _add_field(body, "content_sentiment_max", content_sentiment_max)
 
         result = await make_api_request(api_token=api_token, path="/api/breaking_news", json_data=body)
-        return json.dumps(result, indent=2)
+        return json.dumps(_project_result(result, fields), indent=2)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -994,6 +1097,7 @@ async def search_by_author(
     content_sentiment_max: float | None = None,
     custom_tags: dict[str, list[str]] | None = None,
     robots_compliant: bool | None = None,
+    fields: list[str] | None = None,
 ) -> str:
     """
     All articles written by one specific byline (exact match).
@@ -1112,6 +1216,9 @@ async def search_by_author(
         body.update(flatten_custom_tags(custom_tags))
         _add_field(body, "robots_compliant", robots_compliant)
 
+        source = build_source(fields, clustered=False)
+        if source is not None:
+            body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/authors", json_data=body)
         return json.dumps(result, indent=2)
     except ValueError as e:
@@ -1130,6 +1237,7 @@ async def search_by_link(
     page: int = 1,
     page_size: int = 100,
     robots_compliant: bool | None = None,
+    fields: list[str] | None = None,
 ) -> str:
     """
     Look up specific, already-known articles by NewsCatcher id or URL.
@@ -1174,6 +1282,9 @@ async def search_by_link(
         _add_field(body, "to_", to_)
         _add_field(body, "robots_compliant", robots_compliant)
 
+        source = build_source(fields, clustered=False)
+        if source is not None:
+            body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/search_by_link", json_data=body)
         return json.dumps(result, indent=2)
     except ValueError as e:

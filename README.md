@@ -100,6 +100,12 @@ forwards HTTP headers to the backend but **not** URL query parameters. Use the
 
 **Direct server access** (no gateway): `?apiToken=YOUR_TOKEN` in the URL still works.
 
+## Configuration
+
+- `NEWS_API_BASE_URL` — overrides the upstream News API v3 base URL (defaults to
+  `https://v3-api.newscatcherapi.com`). Only needed to point at a non-default
+  environment.
+
 ## Query Workflow Tips
 
 - **Defaults favor richer results.** `search_articles` defaults `clustering_enabled`,
