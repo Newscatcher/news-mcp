@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+##  [0.2.0] — 2026-07-15
+
+### Fixed
+- `lint_query` no longer rejects valid grouped queries such as `(natural gas)
+  AND (demand OR supply)`. The "unquoted multi-word phrase + OR/NOT" check
+  now collapses balanced parenthesised groups and quoted phrases to
+  placeholders before judging, so only ungrouped, top-level runs are flagged
+  -- the flat `AI OR artificial intelligence` mistake is still caught. Grounded
+  in an eval replaying 2,520 real production queries from 63 live customer
+  keys; ~8-9% of them tripped this false positive, hitting power users hardest.
+- `search_articles` no longer returns a 422 when a clustered search's date
+  range straddles 2026-01-01 (the API cannot cluster across that boundary).
+  The range is auto-split into two clustered requests -- one entirely before,
+  one entirely on/after the boundary -- and merged into a single clustered
+  response with a `date_range_split` note. Clustering stays on by default. A
+  range ending exactly at 2026-01-01 is accepted as-is and not split, matching
+  the API's own boundary check.
+
+### Added
+- Opt-in `fields` param on the article tools to trim each returned article
+  (flat and nested under `clusters`) to just the requested keys -- the News
+  API v3 response is ~40 fields per article and the `content` body alone can
+  make a 30-article call exceed 340 KB / ~86K tokens. No-op unless passed;
+  default output is unchanged.
+- Regression tests for grouped-query acceptance, field projection, and the
+  date-range straddle detector; updated the fail-early test and integration
+  assertions to match (a straddling clustered range is now split, not
+  rejected).
+
 ## [0.1.0] — 2026-07-14
 
 ### Added
