@@ -515,11 +515,8 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
             (server.search_by_link, {}, "Provide one of ids or links"),
             (server.list_sources, {}, "requires at least one filter parameter"),
             (server.list_sources, {"source_url": ["bbc.com"]}, "only be used together with"),
-            (
-                server.search_articles,
-                {"q": "ai", "clustering_enabled": True, "from_": "2025-12-01", "to_": "2026-01-15"},
-                "straddle the boundary",
-            ),
+            # NB: a clustered search straddling 2026-01-01 no longer fails early -- it is
+            # split at the boundary and merged (see ClusteringStraddleTests + integration).
         ]
         for tool_func, kwargs, expected_message_fragment in invalid_calls:
             with self.subTest(tool=tool_func.__name__, kwargs=kwargs):
@@ -528,6 +525,83 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 mock_api.assert_not_called()
                 self.assertTrue(result.startswith("Error: "), result)
                 self.assertIn(expected_message_fragment, result)
+
+
+class GroupedQueryLintTests(unittest.TestCase):
+    """F0: lint_query must NOT reject valid parenthesised / quoted grouped queries
+    (real production queries were being wrongly blocked), while still catching the
+    flat unquoted-phrase-with-OR/NOT mistake."""
+
+    VALID_GROUPED = [
+        "(natural gas) AND (demand OR supply OR futures OR producer)",
+        "((World Cup 2026) OR (FIFA World Cup 2026) OR (World Cup soccer))",
+        '("pediatric" OR "pediatrician" OR "child health") NOT "global newswire"',
+        "(government robotics) OR (robotics)",
+        "Germany ransomware attack AND (manufacturing OR healthcare OR defense)",
+        'AI OR "artificial intelligence"',
+        "((Taylor Swift) OR (Taylor Swift's) OR (Taylor AND Swift)) NOT crossword",
+    ]
+    STILL_INVALID = [
+        "AI OR artificial intelligence",
+        "apple OR google news",
+        "Tesla NOT elon musk",
+    ]
+
+    def test_grouped_queries_allowed(self) -> None:
+        for q in self.VALID_GROUPED:
+            with self.subTest(q=q):
+                validators.lint_query(q)  # must not raise
+
+    def test_flat_mixed_operator_still_caught(self) -> None:
+        for q in self.STILL_INVALID:
+            with self.subTest(q=q):
+                with self.assertRaises(ValueError):
+                    validators.lint_query(q)
+
+
+class ProjectResultTests(unittest.TestCase):
+    """F1: _project_result trims article fields when `fields` is given, for both a
+    flat `articles` list and articles nested under `clusters`; no-op otherwise."""
+
+    def test_noop_without_fields(self) -> None:
+        r = {"articles": [{"title": "t", "link": "l", "content": "big"}]}
+        self.assertEqual(server._project_result(r, None), r)
+
+    def test_projects_flat_articles(self) -> None:
+        r = {"total_hits": 5, "articles": [{"title": "t", "link": "l", "content": "big", "nlp": {}}]}
+        out = server._project_result(r, ["title", "link"])
+        self.assertEqual(out["articles"][0], {"title": "t", "link": "l"})
+        self.assertEqual(out["total_hits"], 5)
+
+    def test_projects_clustered_articles(self) -> None:
+        r = {"clusters": [{"cluster_id": "c1", "cluster_size": 1,
+                           "articles": [{"title": "t", "link": "l", "content": "big"}]}]}
+        out = server._project_result(r, ["title"])
+        self.assertEqual(out["clusters"][0]["articles"][0], {"title": "t"})
+
+
+class ClusteringStraddleTests(unittest.TestCase):
+    """Detector that decides whether a clustered search must be split at the
+    2026-01-01 boundary (matches the API's own accept/reject behavior)."""
+
+    def test_straddle_true(self) -> None:
+        self.assertTrue(validators.clustering_straddles_cutoff("2025-11-01", "2026-02-01"))
+
+    def test_before_only_false(self) -> None:
+        self.assertFalse(validators.clustering_straddles_cutoff("2025-10-01", "2025-12-31"))
+
+    def test_after_only_false(self) -> None:
+        self.assertFalse(validators.clustering_straddles_cutoff("2026-02-01", "2026-07-01"))
+
+    def test_ends_exactly_at_cutoff_is_not_straddle(self) -> None:
+        # API accepts a range ending at 2026-01-01 (verified), so we must not split it.
+        self.assertFalse(validators.clustering_straddles_cutoff("2025-11-01", "2026-01-01"))
+
+    def test_non_iso_range_false(self) -> None:
+        self.assertFalse(validators.clustering_straddles_cutoff("7 days ago", "now"))
+
+    def test_missing_dates_false(self) -> None:
+        self.assertFalse(validators.clustering_straddles_cutoff(None, None))
 
 
 if __name__ == "__main__":

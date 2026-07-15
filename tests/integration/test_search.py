@@ -14,7 +14,7 @@ class TestSearchArticles:
     async def test_basic_query_returns_articles(self, mcp):
         result = await mcp.call_tool("search_articles", {"q": "technology", "page_size": 5})
         data = call_result_json(result)
-        assert "articles" in data
+        assert "clusters" in data or "articles" in data
         assert data["page_size"] == 5
         assert "total_hits" in data
 
@@ -22,12 +22,12 @@ class TestSearchArticles:
         """q='*' alone is documented as a valid match-all query."""
         result = await mcp.call_tool("search_articles", {"q": "*", "page_size": 1})
         data = call_result_json(result)
-        assert "articles" in data
+        assert "clusters" in data or "articles" in data
 
     async def test_boolean_query(self, mcp):
         result = await mcp.call_tool("search_articles", {"q": "(bitcoin OR ethereum) AND blockchain", "page_size": 3})
         data = call_result_json(result)
-        assert "articles" in data
+        assert "clusters" in data or "articles" in data
 
     async def test_pagination_params_echoed(self, mcp):
         result = await mcp.call_tool("search_articles", {"q": "news", "page": 2, "page_size": 10})
@@ -54,4 +54,4 @@ class TestSearchArticles:
             "search_articles", {"q": "news", "lang": ["en"], "countries": ["US"], "page_size": 3}
         )
         data = call_result_json(result)
-        assert "articles" in data
+        assert "clusters" in data or "articles" in data

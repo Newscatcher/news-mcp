@@ -15,7 +15,7 @@ a legitimate value the API would happily accept.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, TypedDict
 
 # --- Real, schema-enforced enums --------------------------------------------
@@ -334,8 +334,30 @@ def validate_clustering_date_range(clustering_enabled: bool | None, from_: str |
         )
 
 
-_Q_OPERATOR_TOKENS = {"AND", "OR", "NOT", "NEAR", "__QUOTED__"}
+CLUSTERING_CUTOFF_DATE = CLUSTERING_MODEL_CUTOFF.date().isoformat()  # "2026-01-01" (after-half from_)
+CLUSTERING_CUTOFF_PREV_DATE = (CLUSTERING_MODEL_CUTOFF - timedelta(days=1)).date().isoformat()  # "2025-12-31" (before-half to_)
+
+
+def clustering_straddles_cutoff(from_: str | None, to_: str | None) -> bool:
+    """True when a from_/to_ ISO date range spans across the 2026-01-01 clustering
+    cutoff (from_ before it, to_ on/after it). Used to decide whether to split a
+    clustered search into two boundary-safe halves. Silently False on non-ISO /
+    natural-language ranges (the upstream API stays the source of truth)."""
+    if not from_ or not to_:
+        return False
+    try:
+        from_dt = datetime.fromisoformat(from_.strip().replace(" ", "T"))
+        to_dt = datetime.fromisoformat(to_.strip().replace(" ", "T"))
+    except ValueError:
+        return False
+    # Strict on the upper bound: a range ending exactly at 2026-01-01 00:00:00 is
+    # accepted by the API (verified), so it is NOT a straddle and must not be split.
+    return from_dt < CLUSTERING_MODEL_CUTOFF < to_dt
+
+
+_Q_OPERATOR_TOKENS = {"AND", "OR", "NOT", "NEAR", "__QUOTED__", "__GROUP__"}
 _QUOTED_SPAN_RE = re.compile(r'"[^"]*"')
+_PAREN_GROUP_RE = re.compile(r"\([^()]*\)")
 _TOKEN_RE = re.compile(r"[^\s()]+")
 
 
@@ -386,10 +408,26 @@ def lint_query(q: str) -> None:
                 "a bare '*' on its own (match-all) is also fine."
             )
 
-    has_or_or_not = any(token.upper() in ("OR", "NOT") for token in tokens)
+    # The flat-mixed-operator check below must NOT fire on *grouped* queries:
+    # parentheses and quoted phrases are valid grouping the API accepts, e.g.
+    # '(natural gas) AND (demand OR supply)' or 'AI OR "artificial intelligence"'.
+    # Collapse both quoted spans and balanced parenthesised groups (innermost-out,
+    # to handle nesting) to opaque placeholder tokens so only ungrouped, top-level
+    # bare-word runs remain to be judged. A mistake nested *inside* a group is left
+    # to surface as an upstream 422 -- this lint only claims the common flat form
+    # (see the docstring), and false-positively rejecting a valid grouped query is
+    # worse than letting a rarer nested one through.
+    reduced = _QUOTED_SPAN_RE.sub(" __QUOTED__ ", q)
+    prev = None
+    while prev != reduced:
+        prev = reduced
+        reduced = _PAREN_GROUP_RE.sub(" __GROUP__ ", reduced)
+    flat_tokens = _TOKEN_RE.findall(reduced)
+
+    has_or_or_not = any(token.upper() in ("OR", "NOT") for token in flat_tokens)
     if has_or_or_not:
         consecutive_bare_words = 0
-        for token in tokens:
+        for token in flat_tokens:
             is_operator_or_quoted = token.upper() in _Q_OPERATOR_TOKENS or token.startswith(("+", "-"))
             if is_operator_or_quoted:
                 consecutive_bare_words = 0
