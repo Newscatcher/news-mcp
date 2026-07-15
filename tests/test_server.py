@@ -580,6 +580,30 @@ class ProjectResultTests(unittest.TestCase):
         self.assertEqual(out["clusters"][0]["articles"][0], {"title": "t"})
 
 
+class BuildSourceTests(unittest.TestCase):
+    """`fields` -> `_source` (server-side field selection). Path prefix is shape-aware:
+    flat results use `articles.*`, clustered results use `clusters.articles.*`."""
+
+    def test_none_returns_none(self) -> None:
+        self.assertIsNone(server.build_source(None, clustered=False))
+        self.assertIsNone(server.build_source([], clustered=True))
+
+    def test_flat_prefix(self) -> None:
+        s = server.build_source(["title", "link", "nlp.summary"], clustered=False)
+        self.assertIn("articles.title", s)
+        self.assertIn("articles.nlp.summary", s)
+        self.assertNotIn("clusters.articles", s)
+        self.assertIn("total_hits", s)
+
+    def test_clustered_prefix(self) -> None:
+        s = server.build_source(["title", "link"], clustered=True)
+        self.assertIn("clusters.articles.title", s)
+        self.assertIn("clusters.cluster_id", s)
+        self.assertIn("clusters.cluster_size", s)
+        # must NOT emit the flat prefix as a standalone path (would drop clusters)
+        self.assertNotIn(",articles.title", "," + s)
+
+
 class ClusteringStraddleTests(unittest.TestCase):
     """Detector that decides whether a clustered search must be split at the
     2026-01-01 boundary (matches the API's own accept/reject behavior)."""

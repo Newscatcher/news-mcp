@@ -55,7 +55,7 @@ session_api_token: contextvars.ContextVar[str] = contextvars.ContextVar("session
 _session_api_tokens: dict[str, str] = {}
 
 # API Configuration
-API_BASE_URL = os.getenv("NEWS_API_BASE_URL") or "https://v3-api.newscatcherapi.com"
+API_BASE_URL = "https://v3-api.newscatcherapi.com"
 
 
 class ApiTokenASGIMiddleware:
@@ -404,6 +404,29 @@ def _project_result(result: Any, fields: list[str] | None) -> Any:
     return result
 
 
+def build_source(fields: list[str] | None, clustered: bool) -> str | None:
+    """Turn a caller's list of article field names into the News API `_source`
+    value: a comma-separated string of dotted paths that trims the response
+    SERVER-SIDE (so the ~40 fields/article, incl. the large `content` body, never
+    cross the wire). Returns None when fields is None (no projection).
+
+    The path prefix depends on the response shape, which the API is strict about:
+    a flat result nests articles under `articles.*`; a clustered result nests them
+    under `clusters.articles.*` (and using the wrong prefix silently drops the whole
+    articles/clusters payload). A few structural top-level keys are always kept.
+    """
+    if not fields:
+        return None
+    if clustered:
+        top = ["total_hits", "page", "page_size", "clusters_count",
+               "clusters.cluster_id", "clusters.cluster_size"]
+        prefix = "clusters.articles."
+    else:
+        top = ["total_hits", "page", "page_size", "total_pages"]
+        prefix = "articles."
+    return ",".join(top + [prefix + f for f in fields])
+
+
 async def _search_clustered_across_cutoff(api_token: str, body: dict[str, Any]) -> dict[str, Any]:
     """Clustering can't span the 2026-01-01 boundary (the API 422s). When a clustered
     search's date range straddles it, run the two halves -- each entirely on one side,
@@ -704,11 +727,15 @@ async def search_articles(
         _add_field(body, "exclude_duplicates", exclude_duplicates)
         _add_field(body, "robots_compliant", robots_compliant)
 
-        if body.get("clustering_enabled") is True and clustering_straddles_cutoff(from_, to_):
+        clustered = body.get("clustering_enabled") is True
+        source = build_source(fields, clustered)
+        if source is not None:
+            body["_source"] = source  # server-side field trim; inherited by both split halves
+        if clustered and clustering_straddles_cutoff(from_, to_):
             result = await _search_clustered_across_cutoff(api_token, body)
         else:
             result = await make_api_request(api_token=api_token, path="/api/search", json_data=body)
-        return json.dumps(_project_result(result, fields), indent=2)
+        return json.dumps(result, indent=2)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -894,8 +921,11 @@ async def get_latest_headlines(
         body.update(flatten_custom_tags(custom_tags))
         _add_field(body, "robots_compliant", robots_compliant)
 
+        source = build_source(fields, body.get("clustering_enabled") is True)
+        if source is not None:
+            body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/latest_headlines", json_data=body)
-        return json.dumps(_project_result(result, fields), indent=2)
+        return json.dumps(result, indent=2)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -1186,8 +1216,11 @@ async def search_by_author(
         body.update(flatten_custom_tags(custom_tags))
         _add_field(body, "robots_compliant", robots_compliant)
 
+        source = build_source(fields, clustered=False)
+        if source is not None:
+            body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/authors", json_data=body)
-        return json.dumps(_project_result(result, fields), indent=2)
+        return json.dumps(result, indent=2)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -1249,8 +1282,11 @@ async def search_by_link(
         _add_field(body, "to_", to_)
         _add_field(body, "robots_compliant", robots_compliant)
 
+        source = build_source(fields, clustered=False)
+        if source is not None:
+            body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/search_by_link", json_data=body)
-        return json.dumps(_project_result(result, fields), indent=2)
+        return json.dumps(result, indent=2)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
