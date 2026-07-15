@@ -55,7 +55,7 @@ session_api_token: contextvars.ContextVar[str] = contextvars.ContextVar("session
 _session_api_tokens: dict[str, str] = {}
 
 # API Configuration
-API_BASE_URL = "https://v3-api.newscatcherapi.com"
+API_BASE_URL = os.getenv("NEWS_API_BASE_URL") or "https://v3-api.newscatcherapi.com"
 
 
 class ApiTokenASGIMiddleware:

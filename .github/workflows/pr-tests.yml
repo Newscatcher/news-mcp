@@ -28,6 +28,7 @@ jobs:
       - name: Start MCP server
         env:
           NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
+          NEWS_API_BASE_URL: ${{ vars.NEWS_API_BASE_URL }}
         run: |
           python server.py &
           echo "SERVER_PID=$!" >> $GITHUB_ENV
