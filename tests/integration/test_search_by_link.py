@@ -15,7 +15,8 @@ class TestSearchByLink:
         # Find a real, current article via search_articles first, then look it up
         # by link -- keeps this test independent of any specific hardcoded URL.
         search_result = await mcp.call_tool("search_articles", {"q": "news", "page_size": 1})
-        articles = call_result_json(search_result)["articles"]
+        _data = call_result_json(search_result)
+        articles = _data.get("articles") or _data.get("clusters", [{}])[0].get("articles", [])
         assert articles, "Expected at least one article from search_articles to look up"
 
         result = await mcp.call_tool("search_by_link", {"links": [articles[0]["link"]]})
@@ -24,7 +25,8 @@ class TestSearchByLink:
 
     async def test_lookup_by_id(self, mcp):
         search_result = await mcp.call_tool("search_articles", {"q": "news", "page_size": 1})
-        articles = call_result_json(search_result)["articles"]
+        _data = call_result_json(search_result)
+        articles = _data.get("articles") or _data.get("clusters", [{}])[0].get("articles", [])
         assert articles, "Expected at least one article from search_articles to look up"
 
         result = await mcp.call_tool("search_by_link", {"ids": [articles[0]["id"]]})
