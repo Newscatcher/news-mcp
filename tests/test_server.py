@@ -222,6 +222,48 @@ class ValidationHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validators.validate_search_in(["title", "content", "summary"])
 
+    def test_validate_lang(self) -> None:
+        # valid codes (either casing) and empty inputs are accepted
+        validators.validate_lang(["en", "es", "de"])
+        validators.validate_lang(["EN"])
+        validators.validate_lang(["cn", "tw"])  # NewsCatcher Chinese codes
+        validators.validate_lang(None)
+        validators.validate_lang([])
+        # the real-world error classes are rejected
+        with self.assertRaises(ValueError):
+            validators.validate_lang(["english"])  # full name
+        with self.assertRaises(ValueError):
+            validators.validate_lang(["zh"])  # ISO Chinese, not accepted upstream
+        with self.assertRaises(ValueError):
+            validators.validate_lang(["en", "xx"])  # one bad code in a list
+
+    def test_validate_lang_hint_mentions_chinese_deviation(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            validators.validate_lang(["zh"])
+        self.assertIn("cn", str(ctx.exception))
+        self.assertIn("zh", str(ctx.exception))
+
+    def test_validate_country(self) -> None:
+        validators.validate_country(["US", "GB", "DE"])
+        validators.validate_country(["us"])  # lowercase accepted
+        validators.validate_country(None)
+        validators.validate_country([])
+        with self.assertRaises(ValueError):
+            validators.validate_country(["USA"])  # 3-letter
+        with self.assertRaises(ValueError):
+            validators.validate_country(["UK"])  # common mistake -> GB
+        with self.assertRaises(ValueError):
+            validators.validate_country(["XK"])  # user-assigned, not officially ISO
+        with self.assertRaises(ValueError):
+            validators.validate_country(["United States"])  # full name
+
+    def test_lang_country_code_lists_wellformed(self) -> None:
+        # every code is a distinct two-letter token; the Chinese deviation holds
+        self.assertTrue(all(len(c) == 2 for c in validators.LANG_CODES))
+        self.assertTrue(all(len(c) == 2 for c in validators.COUNTRY_CODES))
+        self.assertIn("cn", validators.LANG_CODES)
+        self.assertNotIn("zh", validators.LANG_CODES)
+
     def test_validate_top_n_articles_page_size(self) -> None:
         validators.validate_top_n_articles_page_size(10, 100)
         validators.validate_top_n_articles_page_size(None, 100)
