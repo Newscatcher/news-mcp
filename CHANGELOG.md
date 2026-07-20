@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+##  [0.3.0] — 2026-07-20
+
+- Adds client-side validation for `lang`/`not_lang` and `country`/`not_country` across all 5 tools that accept them (`search_articles`, `get_latest_headlines`, `search_by_author`, `list_sources`, `get_aggregation_count`). An unknown code now returns an immediate corrective error instead of a wasted API round-trip.
+
 ##  [0.2.0] — 2026-07-15
 
 ### Fixed
