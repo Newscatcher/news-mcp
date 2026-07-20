@@ -41,6 +41,53 @@ SEARCH_IN_VALUES = (
     "title_content_translated",
 )
 
+# --- lang / country code allowlists -----------------------------------------
+# Unlike search_in/theme (open `string` fields), `lang` and `country` are
+# validated as CLOSED sets by the API: an unknown value returns HTTP 422, not
+# empty results (confirmed live -- the API 422s on "english", "USA", "UK", and
+# the ISO "zh"). Enforcing them client-side turns the single most common real
+# customer error (full names, 3-letter codes, or ISO codes NewsCatcher doesn't
+# use) into an immediate, corrective message instead of a wasted round-trip.
+#
+# LANG: the codes NewsCatcher supports, verbatim from the docs' Enumerated
+# Parameters page (the enumerated list itself -- the page's prose says "123
+# languages" but the list contains 124; the list is authoritative). NB
+# NewsCatcher deviates from ISO 639-1 on Chinese only -- it uses `cn` (China)
+# and `tw` (Taiwan) and REJECTS the ISO `zh`. Re-sync if the list drifts.
+LANG_CODES = frozenset(
+    """
+    af am an ar as av az ba be bg bh bn bo br bs ca ce co cs cv cy da de dv el
+    en eo es et eu fa fi fr fy ga gd gl gn gu gv he hi hr ht hu hy ia id ie io
+    is it ja jv ka kk km kn ko ku kv kw ky la lb li lo lt lv mg mk ml mn mr ms
+    mt my ne nl nn no oc or os pa pl ps pt qu rm ro ru sa sc sd sh si sk sl so
+    sq sr su sv sw ta te tg th tk tl tr tt ug uk ur uz vi vo wa yi yo cn tw
+    """.split()
+)
+
+# COUNTRY: ISO 3166-1 alpha-2 officially-assigned codes. The API rejects
+# anything outside this set -- confirmed live that it 422s on the user-assigned
+# `XK` (Kosovo) and the common-but-wrong `UK`. No NewsCatcher deviation here.
+COUNTRY_CODES = frozenset(
+    """
+    AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ
+    BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR
+    CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR
+    GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU
+    ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ
+    LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ
+    MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF
+    PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI
+    SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR
+    TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW
+    """.split()
+)
+
+# Pre-lowercased for case-insensitive membership checks (the docs write lang
+# lowercase, country uppercase; we accept either casing rather than risk
+# rejecting a value the API would take).
+_LANG_CODES_LOWER = frozenset(c.lower() for c in LANG_CODES)
+_COUNTRY_CODES_LOWER = frozenset(c.lower() for c in COUNTRY_CODES)
+
 # Characters News API v3's `q` grammar forbids outright, plus their
 # percent-encoded equivalents, per the Advanced Querying guide.
 _FORBIDDEN_Q_CHARS = ("[", "]", "/", "\\", ":", "^")
@@ -217,6 +264,47 @@ def validate_search_in(values: list[str] | None) -> None:
         return
     if len(values) > 2:
         raise ValueError(f"search_in accepts at most 2 values, got {len(values)}: {values}")
+
+
+def _validate_codes(
+    values: list[str] | None, allowed_lower: frozenset[str], field_name: str, hint: str
+) -> None:
+    """Reject any value not in the closed allowlist (case-insensitive). Shared
+    core for the lang/country checks -- unlike search_in/theme these ARE closed
+    sets the API 422s on, so pre-empting the bad values with a corrective hint
+    beats a wasted round-trip."""
+    if not values:
+        return
+    bad = [v for v in values if v.strip().lower() not in allowed_lower]
+    if bad:
+        raise ValueError(f"{field_name} has invalid value(s) {bad}. {hint}")
+
+
+def validate_lang(values: list[str] | None, field_name: str = "lang") -> None:
+    """Validate ISO 639-1-style language codes against NewsCatcher's supported
+    set. Catches the #1 real error (full names like 'english') and the Chinese
+    deviation (`zh` is not accepted; use `cn`/`tw`)."""
+    _validate_codes(
+        values,
+        _LANG_CODES_LOWER,
+        field_name,
+        "Use NewsCatcher two-letter language codes (e.g. en, es, de), not full "
+        "language names. Note: Chinese is 'cn' (China) or 'tw' (Taiwan) -- the "
+        "ISO code 'zh' is NOT accepted.",
+    )
+
+
+def validate_country(values: list[str] | None, field_name: str = "countries") -> None:
+    """Validate publisher-country codes against ISO 3166-1 alpha-2. Catches full
+    names, 3-letter codes ('USA'), and the common 'UK' mistake (use 'GB')."""
+    _validate_codes(
+        values,
+        _COUNTRY_CODES_LOWER,
+        field_name,
+        "Use two-letter ISO 3166-1 alpha-2 codes (e.g. US, GB, DE), not full "
+        "country names or 3-letter codes. Common gotcha: the United Kingdom is "
+        "'GB', not 'UK'.",
+    )
 
 
 def validate_top_n_articles_page_size(top_n_articles: int | None, page_size: int | None) -> None:

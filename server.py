@@ -37,7 +37,9 @@ from validators import (
     lint_query,
     validate_choice,
     validate_clustering_threshold,
+    validate_country,
     validate_ids_or_links,
+    validate_lang,
     validate_page_params,
     validate_rank,
     validate_search_in,
@@ -672,6 +674,10 @@ async def search_articles(
         validate_sentiment_range(title_sentiment_max, "title_sentiment_max")
         validate_sentiment_range(content_sentiment_min, "content_sentiment_min")
         validate_sentiment_range(content_sentiment_max, "content_sentiment_max")
+        validate_lang(lang, "lang")
+        validate_lang(not_lang, "not_lang")
+        validate_country(countries, "countries")
+        validate_country(not_countries, "not_countries")
         # NB: a clustered range straddling 2026-01-01 is handled below by splitting at
         # the boundary (not rejected), so we intentionally do NOT pre-raise here.
 
@@ -879,6 +885,10 @@ async def get_latest_headlines(
         validate_sentiment_range(title_sentiment_max, "title_sentiment_max")
         validate_sentiment_range(content_sentiment_min, "content_sentiment_min")
         validate_sentiment_range(content_sentiment_max, "content_sentiment_max")
+        validate_lang(lang, "lang")
+        validate_lang(not_lang, "not_lang")
+        validate_country(countries, "countries")
+        validate_country(not_countries, "not_countries")
 
         body: dict[str, Any] = {"page": page, "page_size": page_size}
         _add_field(body, "when", when)
@@ -1176,6 +1186,10 @@ async def search_by_author(
         validate_sentiment_range(title_sentiment_max, "title_sentiment_max")
         validate_sentiment_range(content_sentiment_min, "content_sentiment_min")
         validate_sentiment_range(content_sentiment_max, "content_sentiment_max")
+        validate_lang(lang, "lang")
+        validate_lang(not_lang, "not_lang")
+        validate_country(countries, "countries")
+        validate_country(not_countries, "not_countries")
 
         body: dict[str, Any] = {"author_name": author_name, "page": page, "page_size": page_size}
         _add_field(body, "not_author_name", not_author_name)
@@ -1375,6 +1389,8 @@ async def list_sources(
         )
         validate_rank(from_rank, "from_rank")
         validate_rank(to_rank, "to_rank")
+        validate_lang(lang, "lang")
+        validate_country(countries, "countries")
 
         body: dict[str, Any] = {}
         _add_list_field(body, "lang", lang)
@@ -1537,6 +1553,10 @@ async def get_aggregation_count(
         validate_sentiment_range(title_sentiment_max, "title_sentiment_max")
         validate_sentiment_range(content_sentiment_min, "content_sentiment_min")
         validate_sentiment_range(content_sentiment_max, "content_sentiment_max")
+        validate_lang(lang, "lang")
+        validate_lang(not_lang, "not_lang")
+        validate_country(countries, "countries")
+        validate_country(not_countries, "not_countries")
 
         body: dict[str, Any] = {"q": q, "page": page, "page_size": page_size}
         _add_field(body, "aggregation_by", aggregation_by)
