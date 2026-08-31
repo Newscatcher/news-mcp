@@ -19,10 +19,10 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-# No hosted news-mcp URL exists yet -- default to localhost so tests "just work"
-# against a locally started server with zero extra config. pr-tests.yml sets
-# MCP_SERVER_URL explicitly either way.
-# TODO: point at the hosted news-mcp URL once one exists.
+# Defaults to localhost so tests "just work" against a locally started server
+# with zero extra config. Point MCP_SERVER_URL at
+# https://news-mcp.newscatcherapi.com/mcp to run against the hosted deployment
+# instead. pr-tests.yml sets MCP_SERVER_URL explicitly either way.
 SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8000/mcp")
 API_KEY = os.getenv("NEWS_API_KEY", "")
 

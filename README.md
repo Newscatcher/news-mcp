@@ -6,24 +6,16 @@ subscription/quota info.
 
 ## Quick Start
 
-There is no hosted deployment of this server yet — run it yourself:
-
-```bash
-git clone <this-repo>
-cd news-mcp
-pip install -r requirements.txt
-NEWS_API_KEY=your_token python server.py
-```
-
 Get a News API token at [newscatcherapi.com](https://www.newscatcherapi.com/). Then
-connect an MCP client to `http://localhost:8000/mcp`:
+connect an MCP client to the hosted deployment at
+`https://news-mcp.newscatcherapi.com/mcp`:
 
 ```json
 {
   "mcpServers": {
     "news": {
       "type": "http",
-      "url": "http://localhost:8000/mcp",
+      "url": "https://news-mcp.newscatcherapi.com/mcp",
       "headers": { "x-api-token": "YOUR_API_TOKEN" }
     }
   }
@@ -33,14 +25,20 @@ connect an MCP client to `http://localhost:8000/mcp`:
 Or via Claude Code CLI:
 
 ```bash
-claude mcp add --transport http news "http://localhost:8000/mcp" --header "x-api-token: YOUR_API_TOKEN"
+claude mcp add --transport http news "https://news-mcp.newscatcherapi.com/mcp" --header "x-api-token: YOUR_API_TOKEN"
 ```
 
-<!-- Once a hosted instance exists, replace the above with:
-https://news-mcp.newscatcherapi.com/mcp?apiToken=YOUR_API_TOKEN
--->
+### Running it yourself
 
-See [Running](#running) below for the other ways to start the server.
+```bash
+git clone <this-repo>
+cd news-mcp
+pip install -r requirements.txt
+NEWS_API_KEY=your_token python server.py
+```
+
+Then connect the same way, pointing at `http://localhost:8000/mcp` instead of the
+hosted URL. See [Running](#running) below for the other ways to start the server.
 
 ## Tool To Endpoint Mapping
 
@@ -108,6 +106,23 @@ forwards HTTP headers to the backend but **not** URL query parameters. Use the
 
 ## Query Workflow Tips
 
+- **"Latest"/"most recent" needs `sort_by="date"` explicitly.** Every tool that
+  takes `sort_by` defaults to `"relevancy"`, not `"date"` — a request like "show
+  me the most recent headlines" that omits `sort_by` will silently rank by
+  relevance within the time window, not recency, and can return results that are
+  many hours older than the true latest. Pass `sort_by="date"` whenever recency
+  is the actual intent.
+- **A full-text `AND` match can be topically tangential.** `q="Nvidia AND
+  earnings"` matches any article containing both words anywhere in the body, not
+  just articles *about* Nvidia's earnings — e.g. a Boston Scientific earnings
+  report that mentions Nvidia once in passing is a valid match. For topical
+  precision use `NEAR("term_a", "term_b", distance)` with a tight distance, a
+  quoted phrase, or leave `sort_by` at its relevancy default rather than
+  overriding to `"date"`.
+- **A domain-level source filter spans every language edition of that
+  publisher.** `sources=["bbc.com"]` matches BBC's Ukrainian, Punjabi, Telugu,
+  Hausa, etc. services too, not just BBC English — combine with `lang=["en"]`
+  when "BBC's headlines" means the English edition.
 - **Defaults favor richer results.** `search_articles` defaults `clustering_enabled`,
   `exclude_duplicates`, and `include_nlp_data` to `true`; `get_latest_headlines`,
   `get_breaking_news`, and `search_by_author` default `include_nlp_data` to `true`.
