@@ -669,6 +669,19 @@ class ProjectResultTests(unittest.TestCase):
         out = server._project_result(r, ["title"])
         self.assertEqual(out["clusters"][0]["articles"][0], {"title": "t"})
 
+    def test_projects_breaking_news_events(self) -> None:
+        """Regression: get_breaking_news's shape is breaking_news_events[].articles,
+        which neither the `articles` nor `clusters` branch matched -- fields was a
+        silent no-op for this tool before this branch was added."""
+        r = {
+            "breaking_news_events": [
+                {"event_id": "e1", "articles_count": 1,
+                 "articles": [{"title": "t", "link": "l", "content": "big"}]}
+            ]
+        }
+        out = server._project_result(r, ["title"])
+        self.assertEqual(out["breaking_news_events"][0]["articles"][0], {"title": "t"})
+
 
 class BuildSourceTests(unittest.TestCase):
     """`fields` -> `_source` (server-side field selection). Path prefix is shape-aware:

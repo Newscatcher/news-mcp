@@ -401,8 +401,9 @@ def _add_comma_list_field(body: dict[str, Any], key: str, value: list[str] | Non
 
 def _project_result(result: Any, fields: list[str] | None) -> Any:
     """Opt-in output projection. When `fields` is provided, trim every returned
-    article -- both a top-level `articles` list and articles nested under
-    `clusters` -- to just those top-level keys. No-op when `fields` is None.
+    article -- a top-level `articles` list, articles nested under `clusters`, and
+    articles nested under `breaking_news_events` (get_breaking_news's own shape)
+    -- to just those top-level keys. No-op when `fields` is None.
 
     News API v3 returns ~40 fields per article (plus large `all_links` /
     `all_domain_links` / `nlp` structures), which can blow an agent's context on a
@@ -412,7 +413,11 @@ def _project_result(result: Any, fields: list[str] | None) -> Any:
 
     There is no top-level "summary" field on an article -- a common mistake.
     Use "description" for the short lede, or the dotted path "nlp.summary" for
-    the AI-generated summary (requires `include_nlp_data=True`, the default).
+    the AI-generated summary (requires `include_nlp_data=True`, the default) --
+    note this dotted form only works via build_source's server-side `_source`
+    trim, not here: this function only matches exact top-level keys, so nested
+    paths like "nlp.summary" won't trim get_breaking_news's response (there is
+    no server-side equivalent for that endpoint).
     Requesting a field name that doesn't exist is silently dropped, not an error.
     """
     if not fields or not isinstance(result, dict):
@@ -428,6 +433,10 @@ def _project_result(result: Any, fields: list[str] | None) -> Any:
         for c in result["clusters"]:
             if isinstance(c, dict) and isinstance(c.get("articles"), list):
                 c["articles"] = [proj(a) for a in c["articles"]]
+    if isinstance(result.get("breaking_news_events"), list):
+        for e in result["breaking_news_events"]:
+            if isinstance(e, dict) and isinstance(e.get("articles"), list):
+                e["articles"] = [proj(a) for a in e["articles"]]
     return result
 
 
