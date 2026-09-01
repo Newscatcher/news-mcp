@@ -233,8 +233,11 @@ default) to see actual mention counts in `nlp.ner_*`.
 News API translates non-English articles to English at index time (translation fields available for
 articles published from 2025-03-12 onward), so entity names and keywords work across languages using
 their English form even when the underlying article is in another language:
-- Set `search_in=["title_content", "title_content_translated"]` to search both original and translated
-  text in one call.
+- `search_in` defaults to `title_content` (title+content) — leave it unset for most queries. Narrow to
+  `["title"]` for high-precision matching on one specific company/event/person. For multilingual
+  coverage with the same English-language query, use `["title_translated"]`/`["title_content_translated"]`
+  instead of the default, or add one alongside it — e.g. `search_in=["title_content",
+  "title_content_translated"]` — to search original and translated text in one call.
 - Omit `lang` to search across all languages; use `countries` to focus on specific regions instead.
 - Use official English names in quotes, e.g. `org_entity_name='"European Union" OR "European Commission"'`
   also matches "Union européenne"/"Unión Europea" in French/Spanish articles.
@@ -602,15 +605,25 @@ async def search_articles(
             [ ] / \\ : ^. "*" alone matches all articles (useful for filter-only
             queries). api_token: News API token.
             Optional if provided via x-api-token header or NEWS_API_KEY env var.
-        search_in: Which fields to search q in. Max 2 of: title, content, summary,
-            title_content (default), title_translated, content_translated,
-            summary_translated, title_content_translated. For multilingual coverage,
-            pass ["title_content", "title_content_translated"] to search original and
-            translated text together (see this server's instructions).
+        search_in: Which fields to search q in. Leave unset for most queries -- the
+            default (title_content) already covers title+content, the right breadth
+            for standard recall. Narrow to ["title"] for high-precision matching on
+            one specific company/event/person (fewer, more substantively-relevant
+            hits, not passing mentions). For multilingual coverage with an
+            English-language query, use ["title_translated"] or
+            ["title_content_translated"] alone, or add one to the default (e.g.
+            ["title_content", "title_content_translated"]) to search original and
+            translated text together in one call. Max 2 values. Full value list:
+            title, content, summary, title_content (default), title_translated,
+            content_translated, summary_translated, title_content_translated (see
+            this server's instructions).
         include_translation_fields: Add title_translated_en/content_translated_en and
             nlp.translation_summary/translation_ner_* to results (needs include_nlp_data
             too for the nlp.* fields). See this server's instructions for multilingual tips.
         predefined_sources: Top-N sources per country, e.g. ["top 50 US", "top 20 GB"].
+            Use when the user wants "top"/"major"/"reputable" sources for a country
+            rather than a specific list -- prefer this over enumerating domains by
+            hand via `sources`.
         source_name: Fuzzy match on publisher display name (comma-separated string).
         sources: Include only these domains/subdomains.
         not_sources: Exclude these domains/subdomains.
@@ -865,7 +878,10 @@ async def get_latest_headlines(
         not_lang: Exclude these ISO 639-1 language codes.
         countries: Include only these ISO 3166-1 alpha-2 publisher countries.
         not_countries: Exclude these ISO 3166-1 alpha-2 publisher countries.
-        predefined_sources: Top-N sources per country, e.g. ["top 50 US"].
+        predefined_sources: Top-N sources per country, e.g. ["top 50 US"]. Use when
+            the user wants "top"/"major"/"reputable" sources for a country rather
+            than a specific list -- prefer this over enumerating domains by hand
+            via `sources`.
         sources: Include only these domains/subdomains.
         not_sources: Exclude these domains/subdomains.
         not_author_name: Exclude these author names (comma-separated string).
@@ -1173,7 +1189,10 @@ async def search_by_author(
         api_token: News API token. Optional if provided via x-api-token header or
             NEWS_API_KEY env var.
         not_author_name: Exclude these other author names (comma-separated string).
-        predefined_sources: Top-N sources per country, e.g. ["top 50 US"].
+        predefined_sources: Top-N sources per country, e.g. ["top 50 US"]. Use when
+            the user wants "top"/"major"/"reputable" sources for a country rather
+            than a specific list -- prefer this over enumerating domains by hand
+            via `sources`.
         sources: Include only these domains/subdomains.
         not_sources: Exclude these domains/subdomains.
         lang: Include only these ISO 639-1 language codes.
@@ -1391,7 +1410,10 @@ async def list_sources(
             NEWS_API_KEY env var.
         lang: Include only sources publishing in these ISO 639-1 language codes.
         countries: Include only sources in these ISO 3166-1 alpha-2 countries.
-        predefined_sources: Top-N sources per country, e.g. ["top 50 US"].
+        predefined_sources: Top-N sources per country, e.g. ["top 50 US"]. Use when
+            the user wants "top"/"major"/"reputable" sources for a country rather
+            than a specific list -- prefer this over enumerating domains by hand
+            via `source_url`.
         source_name: Fuzzy (partial) match on publisher display name -- use for
             broad discovery, e.g. source_name="sport" finds any source with
             "sport" in its name.
@@ -1531,12 +1553,22 @@ async def get_aggregation_count(
         api_token: News API token. Optional if provided via x-api-token header or
             NEWS_API_KEY env var.
         aggregation_by: Bucket size: "day" (default), "hour", or "month".
-        search_in: Which fields to search q in. Max 2 of: title, content, summary,
-            title_content (default), title_translated, content_translated,
-            summary_translated, title_content_translated. For multilingual coverage,
-            pass ["title_content", "title_content_translated"] to search original and
-            translated text together (see this server's instructions).
-        predefined_sources: Top-N sources per country, e.g. ["top 50 US"].
+        search_in: Which fields to search q in. Leave unset for most queries -- the
+            default (title_content) already covers title+content, the right breadth
+            for standard recall. Narrow to ["title"] for high-precision matching on
+            one specific company/event/person (fewer, more substantively-relevant
+            hits, not passing mentions). For multilingual coverage with an
+            English-language query, use ["title_translated"] or
+            ["title_content_translated"] alone, or add one to the default (e.g.
+            ["title_content", "title_content_translated"]) to search original and
+            translated text together in one call. Max 2 values. Full value list:
+            title, content, summary, title_content (default), title_translated,
+            content_translated, summary_translated, title_content_translated (see
+            this server's instructions).
+        predefined_sources: Top-N sources per country, e.g. ["top 50 US"]. Use when
+            the user wants "top"/"major"/"reputable" sources for a country rather
+            than a specific list -- prefer this over enumerating domains by hand
+            via `sources`.
         sources: Include only these domains/subdomains.
         not_sources: Exclude these domains/subdomains.
         lang: Include only these ISO 639-1 language codes.
