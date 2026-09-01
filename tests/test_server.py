@@ -222,6 +222,19 @@ class ValidationHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validators.validate_search_in(["title", "content", "summary"])
 
+    def test_validate_fields(self) -> None:
+        validators.validate_fields(None)
+        validators.validate_fields(["title", "link", "description"])
+        validators.validate_fields(["title", "nlp", "nlp.summary", "nlp.theme"])
+        with self.assertRaises(ValueError) as ctx:
+            validators.validate_fields(["title", "summary"])
+        self.assertIn("nlp.summary", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            validators.validate_fields(["not_a_real_field"])
+        self.assertIn("not_a_real_field", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            validators.validate_fields(["nlp.not_a_real_subfield"])
+
     def test_validate_lang(self) -> None:
         # valid codes (either casing) and empty inputs are accepted
         validators.validate_lang(["en", "es", "de"])

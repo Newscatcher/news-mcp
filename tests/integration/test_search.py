@@ -55,3 +55,31 @@ class TestSearchArticles:
         )
         data = call_result_json(result)
         assert "clusters" in data or "articles" in data
+
+    async def test_search_in_as_list_accepted(self, mcp):
+        """Regression: News API v3 rejects a JSON array for search_in over POST
+        (499 "str type expected") -- this server sends it as a comma-joined
+        string internally, but the tool parameter itself stays a list."""
+        result = await mcp.call_tool(
+            "search_articles", {"q": '"Elon Musk"', "search_in": ["title"], "page_size": 3}
+        )
+        data = call_result_json(result)
+        assert "clusters" in data or "articles" in data
+
+    async def test_fields_projects_requested_keys(self, mcp):
+        result = await mcp.call_tool(
+            "search_articles",
+            {"q": "news", "fields": ["title", "link"], "page_size": 3, "clustering_enabled": False},
+        )
+        data = call_result_json(result)
+        for article in data["articles"]:
+            assert set(article.keys()) <= {"title", "link"}
+
+    async def test_fields_rejects_unrecognized_field(self, mcp):
+        """Regression: "summary" isn't a real top-level article field (it's
+        "description" or the dotted "nlp.summary") -- this used to silently
+        vanish from the output instead of erroring."""
+        result = await mcp.call_tool("search_articles", {"q": "news", "fields": ["title", "summary"]})
+        text = call_result_text(result)
+        assert text.startswith("Error:")
+        assert "nlp.summary" in text

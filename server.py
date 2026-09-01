@@ -38,6 +38,7 @@ from validators import (
     validate_choice,
     validate_clustering_threshold,
     validate_country,
+    validate_fields,
     validate_ids_or_links,
     validate_lang,
     validate_page_params,
@@ -701,6 +702,7 @@ async def search_articles(
     try:
         lint_query(q)
         validate_search_in(search_in)
+        validate_fields(fields)
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
         validate_choice(news_domain_type, NEWS_DOMAIN_TYPE_VALUES, "news_domain_type")
         validate_choice(clustering_variable, CLUSTERING_VARIABLE_VALUES, "clustering_variable")
@@ -917,6 +919,7 @@ async def get_latest_headlines(
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
         validate_choice(clustering_variable, CLUSTERING_VARIABLE_VALUES, "clustering_variable")
+        validate_fields(fields)
         validate_page_params(page, page_size)
         validate_clustering_threshold(clustering_threshold)
         validate_sentiment_range(title_sentiment_min, "title_sentiment_min")
@@ -1065,6 +1068,7 @@ async def get_breaking_news(
     """
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
+        validate_fields(fields)
         validate_page_params(page, page_size)
         validate_rank(from_rank, "from_rank")
         validate_rank(to_rank, "to_rank")
@@ -1217,6 +1221,7 @@ async def search_by_author(
     """
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
+        validate_fields(fields)
         validate_page_params(page, page_size)
         validate_rank(from_rank, "from_rank")
         validate_rank(to_rank, "to_rank")
@@ -1325,6 +1330,7 @@ async def search_by_link(
     """
     try:
         validate_ids_or_links(ids, links)
+        validate_fields(fields)
         validate_page_params(page, page_size)
 
         body: dict[str, Any] = {"page": page, "page_size": page_size}
