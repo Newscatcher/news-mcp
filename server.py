@@ -374,9 +374,29 @@ def _add_list_field(body: dict[str, Any], key: str, value: list[str] | None) -> 
     FastMCP validates incoming tool-call arguments against each parameter's
     JSON schema before this function ever runs, so `value` is guaranteed to
     already be a real list or None -- no comma-string coercion is needed here.
+
+    Most multi-value filters accept a native JSON array over POST. A handful
+    (search_in, theme, not_theme, predefined_sources) do not -- News API v3
+    rejects a JSON array for those with a `499 str type expected` (or, for
+    predefined_sources, `422`) error and requires a comma-joined string
+    instead. Use `_add_comma_list_field` for those.
     """
     if value:
         body[key] = value
+
+
+def _add_comma_list_field(body: dict[str, Any], key: str, value: list[str] | None) -> None:
+    """Set body[key] = a comma-joined string if a non-empty list was provided.
+
+    News API v3 rejects a JSON array for search_in/theme/not_theme/
+    predefined_sources over POST (`499 str type expected`, or `422` for
+    predefined_sources) even though it accepts arrays for every other
+    multi-value filter -- confirmed against the live API. The tool parameter
+    stays `list[str]` for a consistent, discoverable schema; this is where
+    that list gets converted to the string form the API actually requires.
+    """
+    if value:
+        body[key] = ",".join(value)
 
 
 def _project_result(result: Any, fields: list[str] | None) -> Any:
@@ -387,8 +407,13 @@ def _project_result(result: Any, fields: list[str] | None) -> Any:
     News API v3 returns ~40 fields per article (plus large `all_links` /
     `all_domain_links` / `nlp` structures), which can blow an agent's context on a
     single call. This lets a caller ask for only what it needs (e.g.
-    fields=["title","link","published_date","domain_url","summary"]) without
+    fields=["title","link","published_date","domain_url","description"]) without
     changing behaviour for callers that don't pass it.
+
+    There is no top-level "summary" field on an article -- a common mistake.
+    Use "description" for the short lede, or the dotted path "nlp.summary" for
+    the AI-generated summary (requires `include_nlp_data=True`, the default).
+    Requesting a field name that doesn't exist is silently dropped, not an error.
     """
     if not fields or not isinstance(result, dict):
         return result
@@ -532,10 +557,14 @@ async def search_articles(
       true for richer, deduplicated, NLP-enriched results -- pass false to opt out
       of any of them. clustering_enabled changes the response shape (see Returns).
     - fields: pass a list of article keys (e.g. ["title","link","published_date",
-      "domain_url","summary","nlp"]) to trim each returned article to just those --
-      News API v3 returns ~40 fields per article (the biggest being the large
-      all_links/all_domain_links/all_links_text arrays), so this keeps large,
-      enriched result sets within an agent's context budget. Omit for full objects.
+      "domain_url","description","nlp"]) to trim each returned article to just
+      those -- News API v3 returns ~40 fields per article (the biggest being the
+      large all_links/all_domain_links/all_links_text arrays), so this keeps
+      large, enriched result sets within an agent's context budget. Omit for full
+      objects. There is no top-level "summary" field -- use "description" for the
+      short lede, or the dotted path "nlp.summary" for the AI-generated summary
+      (needs include_nlp_data=True, the default); an unknown field name is
+      silently dropped, not an error.
     - Hard cap: 10,000 matched articles per query regardless of pagination. Call
       get_aggregation_count first on broad/undated queries to measure actual volume
       and time-chunk the date range accordingly (denser topics need hourly chunks,
@@ -682,9 +711,9 @@ async def search_articles(
         # the boundary (not rejected), so we intentionally do NOT pre-raise here.
 
         body: dict[str, Any] = {"q": q, "page": page, "page_size": page_size}
-        _add_list_field(body, "search_in", search_in)
+        _add_comma_list_field(body, "search_in", search_in)
         _add_field(body, "include_translation_fields", include_translation_fields)
-        _add_list_field(body, "predefined_sources", predefined_sources)
+        _add_comma_list_field(body, "predefined_sources", predefined_sources)
         _add_field(body, "source_name", source_name)
         _add_list_field(body, "sources", sources)
         _add_list_field(body, "not_sources", not_sources)
@@ -719,8 +748,8 @@ async def search_articles(
         _add_field(body, "clustering_threshold", clustering_threshold)
         _add_field(body, "include_nlp_data", include_nlp_data)
         _add_field(body, "has_nlp", has_nlp)
-        _add_list_field(body, "theme", theme)
-        _add_list_field(body, "not_theme", not_theme)
+        _add_comma_list_field(body, "theme", theme)
+        _add_comma_list_field(body, "not_theme", not_theme)
         _add_field(body, "ORG_entity_name", org_entity_name)
         _add_field(body, "PER_entity_name", per_entity_name)
         _add_field(body, "LOC_entity_name", loc_entity_name)
@@ -898,7 +927,7 @@ async def get_latest_headlines(
         _add_list_field(body, "not_lang", not_lang)
         _add_list_field(body, "countries", countries)
         _add_list_field(body, "not_countries", not_countries)
-        _add_list_field(body, "predefined_sources", predefined_sources)
+        _add_comma_list_field(body, "predefined_sources", predefined_sources)
         _add_list_field(body, "sources", sources)
         _add_list_field(body, "not_sources", not_sources)
         _add_field(body, "not_author_name", not_author_name)
@@ -918,8 +947,8 @@ async def get_latest_headlines(
         _add_field(body, "include_translation_fields", include_translation_fields)
         _add_field(body, "include_nlp_data", include_nlp_data)
         _add_field(body, "has_nlp", has_nlp)
-        _add_list_field(body, "theme", theme)
-        _add_list_field(body, "not_theme", not_theme)
+        _add_comma_list_field(body, "theme", theme)
+        _add_comma_list_field(body, "not_theme", not_theme)
         _add_field(body, "ORG_entity_name", org_entity_name)
         _add_field(body, "PER_entity_name", per_entity_name)
         _add_field(body, "LOC_entity_name", loc_entity_name)
@@ -1045,8 +1074,8 @@ async def get_breaking_news(
         _add_field(body, "include_translation_fields", include_translation_fields)
         _add_field(body, "include_nlp_data", include_nlp_data)
         _add_field(body, "has_nlp", has_nlp)
-        _add_list_field(body, "theme", theme)
-        _add_list_field(body, "not_theme", not_theme)
+        _add_comma_list_field(body, "theme", theme)
+        _add_comma_list_field(body, "not_theme", not_theme)
         _add_field(body, "ORG_entity_name", org_entity_name)
         _add_field(body, "PER_entity_name", per_entity_name)
         _add_field(body, "LOC_entity_name", loc_entity_name)
@@ -1193,7 +1222,7 @@ async def search_by_author(
 
         body: dict[str, Any] = {"author_name": author_name, "page": page, "page_size": page_size}
         _add_field(body, "not_author_name", not_author_name)
-        _add_list_field(body, "predefined_sources", predefined_sources)
+        _add_comma_list_field(body, "predefined_sources", predefined_sources)
         _add_list_field(body, "sources", sources)
         _add_list_field(body, "not_sources", not_sources)
         _add_list_field(body, "lang", lang)
@@ -1220,8 +1249,8 @@ async def search_by_author(
         _add_field(body, "include_translation_fields", include_translation_fields)
         _add_field(body, "include_nlp_data", include_nlp_data)
         _add_field(body, "has_nlp", has_nlp)
-        _add_list_field(body, "theme", theme)
-        _add_list_field(body, "not_theme", not_theme)
+        _add_comma_list_field(body, "theme", theme)
+        _add_comma_list_field(body, "not_theme", not_theme)
         _add_field(body, "ner_name", ner_name)
         _add_field(body, "title_sentiment_min", title_sentiment_min)
         _add_field(body, "title_sentiment_max", title_sentiment_max)
@@ -1395,7 +1424,7 @@ async def list_sources(
         body: dict[str, Any] = {}
         _add_list_field(body, "lang", lang)
         _add_list_field(body, "countries", countries)
-        _add_list_field(body, "predefined_sources", predefined_sources)
+        _add_comma_list_field(body, "predefined_sources", predefined_sources)
         _add_field(body, "source_name", source_name)
         _add_list_field(body, "source_url", source_url)
         _add_field(body, "include_additional_info", include_additional_info)
@@ -1560,8 +1589,8 @@ async def get_aggregation_count(
 
         body: dict[str, Any] = {"q": q, "page": page, "page_size": page_size}
         _add_field(body, "aggregation_by", aggregation_by)
-        _add_list_field(body, "search_in", search_in)
-        _add_list_field(body, "predefined_sources", predefined_sources)
+        _add_comma_list_field(body, "search_in", search_in)
+        _add_comma_list_field(body, "predefined_sources", predefined_sources)
         _add_list_field(body, "sources", sources)
         _add_list_field(body, "not_sources", not_sources)
         _add_list_field(body, "lang", lang)
@@ -1588,8 +1617,8 @@ async def get_aggregation_count(
         _add_field(body, "word_count_max", word_count_max)
         _add_field(body, "include_nlp_data", include_nlp_data)
         _add_field(body, "has_nlp", has_nlp)
-        _add_list_field(body, "theme", theme)
-        _add_list_field(body, "not_theme", not_theme)
+        _add_comma_list_field(body, "theme", theme)
+        _add_comma_list_field(body, "not_theme", not_theme)
         _add_field(body, "ORG_entity_name", org_entity_name)
         _add_field(body, "PER_entity_name", per_entity_name)
         _add_field(body, "LOC_entity_name", loc_entity_name)

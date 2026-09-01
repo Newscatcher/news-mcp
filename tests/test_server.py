@@ -487,6 +487,54 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 {"q": "climate change", "page": 1, "page_size": 100},
             ),
             (server.get_subscription, {}, "/api/subscription", None),
+            # Regression: News API v3 rejects a JSON array for search_in/theme/
+            # not_theme/predefined_sources over POST (499 "str type expected", or
+            # 422 for predefined_sources) even though it accepts arrays for every
+            # other multi-value filter -- confirmed against the live API. These
+            # must be sent as a comma-joined string, not a list.
+            (
+                server.search_articles,
+                {"q": "ai", "search_in": ["title", "summary"]},
+                "/api/search",
+                {
+                    "q": "ai",
+                    "page": 1,
+                    "page_size": 100,
+                    "search_in": "title,summary",
+                    "clustering_enabled": True,
+                    "include_nlp_data": True,
+                    "exclude_duplicates": True,
+                },
+            ),
+            (
+                server.search_articles,
+                {"q": "ai", "theme": ["Business"], "not_theme": ["Sports"]},
+                "/api/search",
+                {
+                    "q": "ai",
+                    "page": 1,
+                    "page_size": 100,
+                    "theme": "Business",
+                    "not_theme": "Sports",
+                    "clustering_enabled": True,
+                    "include_nlp_data": True,
+                    "exclude_duplicates": True,
+                },
+            ),
+            (
+                server.search_articles,
+                {"q": "ai", "predefined_sources": ["top 100 US", "top 50 GB"]},
+                "/api/search",
+                {
+                    "q": "ai",
+                    "page": 1,
+                    "page_size": 100,
+                    "predefined_sources": "top 100 US,top 50 GB",
+                    "clustering_enabled": True,
+                    "include_nlp_data": True,
+                    "exclude_duplicates": True,
+                },
+            ),
         ]
         for tool_func, kwargs, expected_path, expected_json in cases:
             with self.subTest(tool=tool_func.__name__, kwargs=kwargs):
