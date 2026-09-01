@@ -224,8 +224,11 @@ common source of broken queries, so read this before constructing a non-trivial 
   broaden with OR, increase NEAR distance, or use a wildcard.
 
 ## Entity search and multilingual coverage
-`org_entity_name`/`per_entity_name`/`loc_entity_name`/`misc_entity_name` (and `ner_name` on
-search_by_author) support the same AND/OR/NOT/NEAR syntax as `q`, plus one more operator:
+When looking for a specific company, person, or location, use the NER entity filters
+(`org_entity_name`/`per_entity_name`/`loc_entity_name`/`misc_entity_name`, or `ner_name` on
+search_by_author) — they match articles where NewsCatcher's NLP recognized the entity as such, which
+catches phrasing a plain `q` keyword search misses (and vice versa: `q` catches mentions the NER model
+missed). These filters support the same AND/OR/NOT/NEAR syntax as `q`, plus one more operator:
 `COUNT("Entity Name", n, "gt")` filters to articles mentioning that entity more than n times — a proxy
 for how central the entity is, not just a passing mention. Combine with `include_nlp_data=true` (the
 default) to see actual mention counts in `nlp.ner_*`.
@@ -243,7 +246,24 @@ their English form even when the underlying article is in another language:
   also matches "Union européenne"/"Unión Europea" in French/Spanish articles.
 - Set `include_translation_fields=true` to get `title_translated_en`/`content_translated_en` and
   `nlp.translation_summary`/`nlp.translation_ner_*` back on each result — the `translation_ner_*` fields
-  need `include_nlp_data=true` too (on by default) to appear.""",
+  need `include_nlp_data=true` too (on by default) to appear.
+
+## Consider running multiple searches, not just one
+A single call is often enough — don't default to running several when one plain query already answers
+the question. But for a query where coverage genuinely matters (tracking a company/person, gauging how
+something is being reported, anything where missing relevant articles would be a real problem), running
+more than one search with different angles and comparing/merging the results can surface things a single
+call would miss. There's no fixed recipe — judge which of these are actually worth it for the query at
+hand:
+- NER entity filter vs. plain `q` keyword search — each catches articles the other misses (see above).
+- Default `search_in` vs. `title_translated`/`title_content_translated` — original-language coverage vs.
+  translated multilingual coverage.
+- `predefined_sources=["top N <country>"]` vs. no source restriction (or `ranked_only=false`) — major-
+  outlet coverage vs. smaller/niche sources that might carry a story the majors haven't picked up.
+- `is_headline=true` vs. unfiltered — front-page/top-billed treatment vs. the full set of mentions.
+- Splitting a broad topic across a few `theme` values instead of one unthemed query, when the topic
+  plausibly spans multiple themes (e.g. Business and Politics).
+Decide per query, not as a fixed checklist — most requests still just need one well-formed call.""",
 )
 
 
