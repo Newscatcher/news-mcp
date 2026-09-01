@@ -157,6 +157,12 @@ on any of these to opt out.
   differently, rather than being strictly complementary: clustering groups related articles (all
   articles kept, reorganized into groups), `exclude_duplicates` removes near-identical ones (fewer
   articles, stays flat, adds `duplicate_count`/`duplicate_articles_group_id` per result).
+- Keep `exclude_duplicates=true` (the default) for most queries -- it's the right default because
+  most callers want distinct stories, not every syndication of the same wire copy. Override to
+  `false` only when: (a) the user explicitly asks to include duplicates/reprints, or (b) the goal is
+  an exhaustive mention count for a specific company/person (e.g. "how many times was X mentioned",
+  "every article about Y") -- deduplication can suppress separate, individually-relevant mentions as
+  "near-identical," which undercounts exactly the thing being measured.
 - `clustering_threshold` (default 0.7, range (0, 1]) controls cluster tightness. Clustering operates
   one page at a time, so raise `page_size` to at least your expected result count for coherent clusters.
 - `clustering_variable` is deprecated (ignored) for articles published on/after 2026-01-01 — since
