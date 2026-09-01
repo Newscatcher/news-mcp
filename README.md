@@ -137,6 +137,15 @@ forwards HTTP headers to the backend but **not** URL query parameters. Use the
   - `clustering_variable` is deprecated (ignored) for articles published on or
     after 2026-01-01; a date range cannot straddle 2026-01-01 when clustering is
     enabled — the API rejects it.
+  - Keep `exclude_duplicates=true` (the default) for most queries — most callers
+    want distinct stories, not every syndication of the same wire copy. Override
+    to `false` only when the user explicitly asks to include duplicates/reprints,
+    or the goal is an exhaustive mention count for a specific company/person —
+    deduplication can suppress separate, individually-relevant mentions as
+    "near-identical," undercounting exactly what's being measured.
+  - `exclude_duplicates` only has an effect on `search_articles` — confirmed live
+    that passing it to `get_latest_headlines`/`search_by_author` is silently
+    ignored (no error, no `duplicate_count` field, no change in results).
 - **Check quota first.** `get_subscription` returns your plan tier, monthly quota,
   and remaining calls — useful before running a large batch of searches, and the
   only way to confirm your token is valid.
@@ -181,22 +190,44 @@ forwards HTTP headers to the backend but **not** URL query parameters. Use the
   `include_additional_info=true`) to bulk-check coverage for many domains in one
   call instead of one call per domain; any domain absent from the response's
   `sources` isn't covered.
+- **Reaching for "top" sources.** `predefined_sources` (e.g. `["top 50 US", "top
+  20 GB"]`) is the right parameter when a user wants "top"/"major"/"reputable"
+  sources for a country — prefer it over manually enumerating domains via
+  `sources`/`source_url`. Available on `search_articles`, `get_latest_headlines`,
+  `search_by_author`, `list_sources`, and `get_aggregation_count`.
+- **`search_in`/`theme`/`not_theme`/`predefined_sources` are lists, sent as
+  comma-joined strings internally.** News API v3 rejects a JSON array for these
+  four multi-value filters over POST (`499`, or `422` for `predefined_sources`),
+  unlike every other multi-value filter (`lang`, `countries`, `sources`, etc.),
+  which does accept arrays — confirmed against the live API. This server handles
+  the translation for you; the tool parameters themselves stay plain lists.
 
 ## Entity Search and Multilingual Coverage
 
-`org_entity_name`/`per_entity_name`/`loc_entity_name`/`misc_entity_name` (and
-`ner_name` on `search_by_author`) support the same `AND`/`OR`/`NOT`/`NEAR` syntax as
-`q`, plus one more operator: `COUNT("Entity Name", n, "gt")` filters to articles
-mentioning that entity more than `n` times — a proxy for how central the entity is,
-not just a passing mention. Combine with `include_nlp_data=true` (the default) to
-see actual mention counts in `nlp.ner_*`.
+When looking for a specific company, person, or location, use the NER entity
+filters (`org_entity_name`/`per_entity_name`/`loc_entity_name`/`misc_entity_name`,
+or `ner_name` on `search_by_author`) — they match articles where NewsCatcher's NLP
+recognized the entity as such, catching phrasing a plain `q` keyword search can
+miss (and vice versa: `q` catches mentions the NER model missed, so the two are
+complementary, not interchangeable). These filters support the same
+`AND`/`OR`/`NOT`/`NEAR` syntax as `q`, plus one more operator: `COUNT("Entity Name",
+n, "gt")` filters to articles mentioning that entity more than `n` times — a proxy
+for how central the entity is, not just a passing mention. Combine with
+`include_nlp_data=true` (the default) to see actual mention counts in `nlp.ner_*`.
 
 News API translates non-English articles to English at index time (translation
 fields available for articles published from 2025-03-12 onward), so entity names
 and keywords work across languages using their English form:
 
-- Set `search_in=["title_content", "title_content_translated"]` to search both
-  original and translated text in one call.
+- `search_in` defaults to `title_content` (title+content) — leave it unset for
+  most queries, since that default already covers standard recall. Narrow to
+  `["title"]` for high-precision matching on one specific company/event/person
+  (fewer, more substantively-relevant hits, not passing mentions). For
+  multilingual coverage with the same English-language query, use
+  `["title_translated"]`/`["title_content_translated"]` instead of the default, or
+  add one alongside it — e.g. `search_in=["title_content",
+  "title_content_translated"]` — to search original and translated text in one
+  call (max 2 values).
 - Omit `lang` to search across all languages; use `countries` to focus on specific
   regions instead.
 - Use official English names in quotes, e.g.
@@ -206,6 +237,52 @@ and keywords work across languages using their English form:
   `content_translated_en` and `nlp.translation_summary`/`nlp.translation_ner_*`
   back on each result (the `translation_ner_*` fields also need
   `include_nlp_data=true`, which is on by default).
+
+## When One Search Isn't Enough
+
+A single call is often enough — don't default to running several when one plain
+query already answers the question. But when coverage genuinely matters (tracking
+a company/person, gauging how something is being reported, anything where missing
+relevant articles would be a real problem), consider running more than one search
+with different angles and comparing/merging the results:
+
+- NER entity filter vs. plain `q` keyword search — each catches articles the other
+  misses.
+- Default `search_in` vs. `title_translated`/`title_content_translated` —
+  original-language coverage vs. translated multilingual coverage.
+- `predefined_sources=["top N <country>"]` vs. no source restriction (or
+  `ranked_only=false`) — major-outlet coverage vs. smaller/niche sources that
+  might carry a story the majors haven't picked up.
+- `is_headline=true` vs. unfiltered — front-page/top-billed treatment vs. the full
+  set of mentions.
+- Splitting a broad topic across a few `theme` values instead of one unthemed
+  query, when the topic plausibly spans multiple themes (e.g. Business and
+  Politics).
+
+Judge which of these are worth it per query, not as a fixed checklist — most
+requests still need only one well-formed call.
+
+## Output Projection (`fields`)
+
+Pass `fields` (a list of article keys) to `search_articles`, `get_latest_headlines`,
+`get_breaking_news`, `search_by_author`, or `search_by_link` to trim each returned
+article to just those keys. News API v3 returns ~40 fields per article — the
+`content` body alone can make a 30-article call exceed 300 KB / ~80K tokens — so
+this keeps large, enriched result sets within an agent's context budget. Omit it
+for full objects; this is purely an MCP-server convenience, not a News API v3
+parameter (it compiles down to the API's `_source` mechanism internally).
+
+- Field names are validated against the real article schema before the request is
+  sent — an unrecognized name (e.g. assuming a top-level `"summary"` field exists)
+  returns an immediate corrective error instead of silently vanishing from the
+  response. News API v3's underlying `_source` mechanism drops any unmatched path
+  with no error at all, so this validation exists specifically to avoid a quietly
+  incomplete result.
+- There is no top-level `summary` field. Use `"description"` for the short lede,
+  or the dotted path `"nlp.summary"` for the AI-generated summary (needs
+  `include_nlp_data=true`, the default).
+- NLP sub-fields need a dotted path, e.g. `"nlp.theme"`, `"nlp.sentiment"`,
+  `"nlp.ner_ORG"` — or pass `"nlp"` alone to keep the whole block.
 
 ## Query Syntax (`q` parameter)
 
