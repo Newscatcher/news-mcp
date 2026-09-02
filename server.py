@@ -171,10 +171,12 @@ translation fields to each article). `search_articles` additionally defaults `cl
 - All five tools that accept `fields` (`search_articles`, `get_latest_headlines`, `get_breaking_news`,
   `search_by_author`, `search_by_link`) default it to a lean set instead of the full ~40-field object:
   `title`, `link`, `published_date`, `domain_url`, `author`, `language`, `nlp.summary`,
-  `nlp.translation_summary`, `nlp.theme`. Pass `fields=[]` explicitly to get full, untrimmed objects —
-  do this when the user asks what else is available or wants to see everything. The default carries
-  both `nlp.summary` and `nlp.translation_summary` so non-English articles still get a usable summary
-  (only one of the two is normally populated on a given article — use whichever one is). Note:
+  `nlp.translation_summary`, `nlp.theme`. Pass `fields=[]` or `fields=null` explicitly to get full,
+  untrimmed objects — do this when the user asks what else is available or wants to see everything.
+  Simply omitting `fields` from the call does NOT do this — it applies the lean default above. The
+  default carries both `nlp.summary` and `nlp.translation_summary` so non-English articles still get
+  a usable summary (only one of the two is normally populated on a given article — use whichever one
+  is). Note:
   `search_by_link` has no `include_translation_fields` toggle, so `nlp.translation_summary` is always
   empty there; only `nlp.summary` populates.
 - Enabling `clustering_enabled` changes the response shape: you get `clusters_count` + `clusters`
@@ -700,9 +702,11 @@ async def search_articles(
       nlp.translation_summary, nlp.theme -- instead of the full ~40-field object
       (the biggest being the all_links/all_domain_links/all_links_text arrays and
       the full `content` body), keeping ordinary result sets within an agent's
-      context budget without extra effort. Pass `fields=[]` explicitly to opt out
-      and get full objects (e.g. the user asks what else is available, or wants
-      to see everything). The default includes both `nlp.summary` and
+      context budget without extra effort. Pass `fields=[]` or `fields=None`
+      explicitly to opt out and get full objects (e.g. the user asks what else is
+      available, or wants to see everything) -- simply omitting `fields` does NOT
+      do this; it applies the lean default above. The default includes both
+      `nlp.summary` and
       `nlp.translation_summary` (needs include_translation_fields=True, also the
       default) so non-English articles still get a usable summary -- when
       presenting results, use whichever of the two is actually populated. There
@@ -843,6 +847,15 @@ async def search_articles(
             True; addresses the same near-duplicate-coverage problem as
             clustering_enabled in a different way (see this server's instructions).
         robots_compliant: Filter by whether the source's robots.txt permits scraping.
+        fields: Trim each returned article to just these keys, e.g. ["title","link",
+            "published_date","domain_url","nlp.summary"] -- supports one level of
+            dotted paths for nested nlp.* keys (there is no top-level "summary" key;
+            use "description" or "nlp.summary"). Defaults to a lean 9-key set (title,
+            link, published_date, domain_url, author, language, nlp.summary,
+            nlp.translation_summary, nlp.theme) instead of the full ~40-field object.
+            To get full, untrimmed objects, pass fields=[] or fields=null explicitly
+            -- simply omitting this parameter does NOT do that; it applies the lean
+            default above.
 
     Returns:
         JSON with `status`, `total_hits`, `page`, `total_pages`, `page_size`, and
@@ -1081,6 +1094,11 @@ async def get_latest_headlines(
         content_sentiment_max: Maximum content sentiment score, -1.0 to 1.0.
         custom_tags: Organization-specific tag filter, e.g. {"my_taxonomy": ["Tag1"]}.
         robots_compliant: Filter by whether the source's robots.txt permits scraping.
+        fields: Trim each returned article to just these keys; defaults to a lean
+            9-key set instead of the full ~40-field object (see search_articles's
+            Args for the full field list and rationale). To get full, untrimmed
+            objects, pass fields=[] or fields=null explicitly -- simply omitting
+            this parameter does NOT do that; it applies the lean default.
 
     Returns:
         JSON with `status`, `total_hits`, `page`, `total_pages`, `page_size`, and
@@ -1239,6 +1257,14 @@ async def get_breaking_news(
         title_sentiment_max: Maximum title sentiment score, -1.0 to 1.0.
         content_sentiment_min: Minimum content sentiment score, -1.0 to 1.0.
         content_sentiment_max: Maximum content sentiment score, -1.0 to 1.0.
+        fields: Trim each returned article to just these keys; defaults to a lean
+            9-key set instead of the full object (see search_articles's Args for
+            the full field list and rationale). Trimmed client-side here (this
+            endpoint's `breaking_news_events[].articles` shape has no server-side
+            `_source` equivalent), not server-side like the other four tools --
+            same effective behavior either way. To get full, untrimmed objects,
+            pass fields=[] or fields=null explicitly -- simply omitting this
+            parameter does NOT do that; it applies the lean default.
 
     Returns:
         JSON with `status`, `total_hits`, `page`, `total_pages`, `page_size`, and
@@ -1398,6 +1424,11 @@ async def search_by_author(
         content_sentiment_max: Maximum content sentiment score, -1.0 to 1.0.
         custom_tags: Organization-specific tag filter, e.g. {"my_taxonomy": ["Tag1"]}.
         robots_compliant: Filter by whether the source's robots.txt permits scraping.
+        fields: Trim each returned article to just these keys; defaults to a lean
+            9-key set instead of the full object (see search_articles's Args for
+            the full field list and rationale). To get full, untrimmed objects,
+            pass fields=[] or fields=null explicitly -- simply omitting this
+            parameter does NOT do that; it applies the lean default.
 
     Returns:
         JSON with `status`, `total_hits`, `page`, `total_pages`, `page_size`,
@@ -1509,6 +1540,13 @@ async def search_by_link(
         page: Page number, 1-indexed. Defaults to 1.
         page_size: Results per page, max 1000. Defaults to 100.
         robots_compliant: Filter by whether the source's robots.txt permits scraping.
+        fields: Trim each returned article to just these keys; defaults to a lean
+            9-key set instead of the full object (see search_articles's Args for
+            the full field list and rationale). Note this tool has no
+            include_translation_fields toggle, so nlp.translation_summary is
+            always empty here -- only nlp.summary populates. To get full,
+            untrimmed objects, pass fields=[] or fields=null explicitly -- simply
+            omitting this parameter does NOT do that; it applies the lean default.
 
     Returns:
         JSON with `status`, `total_hits`, `page`, `total_pages`, `page_size`, `articles`.
