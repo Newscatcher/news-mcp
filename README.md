@@ -184,10 +184,6 @@ forwards HTTP headers to the backend but **not** URL query parameters. Use the
 | 1,000–3,000/day | `"3d"` |
 | 100–1,000/day | `"7d"` |
 | Fewer than 100/day | `"30d"` |
-- **Custom tags.** Pass `custom_tags` as `{"taxonomy_name": ["Tag1", "Tag2"]}` —
-  this server translates it to News API v3's actual wire format (dynamic dotted
-  keys, `custom_tags.taxonomy_name`) for you. Only usable if your organization has
-  custom tags configured on your token.
 - **Checking source coverage.** `list_sources` requires at least one filter
   parameter (e.g. `lang`, `countries`, `source_name`, `source_url`, ...) — there's
   no "list everything" call. Pass a list of domains to `source_url` (with
