@@ -30,6 +30,7 @@ from validators import (
     CLUSTERING_CUTOFF_DATE,
     CLUSTERING_CUTOFF_PREV_DATE,
     CLUSTERING_VARIABLE_VALUES,
+    DEFAULT_ARTICLE_FIELDS,
     NEWS_DOMAIN_TYPE_VALUES,
     SORT_BY_VALUES,
     clustering_straddles_cutoff,
@@ -145,11 +146,20 @@ If no token is found, tools return `Error: API token is required.`
 - `check_health` — local liveness ping only (does not call the News API). Use as a zero-setup first call.
 - There is no "find articles similar to this one" tool. Reach similarity via `clustering_enabled`+`clustering_threshold` (on `search_articles`/`get_latest_headlines`), `exclude_duplicates` (search only), or by requesting `include_nlp_data=true` and comparing the returned embeddings yourself.
 
-## Defaults for simple queries — clustering, deduplication, and NLP
+## Defaults for simple queries — clustering, deduplication, NLP, and output fields
 `search_articles`, `get_latest_headlines`, `get_breaking_news`, and `search_by_author` default
-`include_nlp_data` to `true` (adds theme/sentiment/NER/summary to each article). `search_articles`
-additionally defaults `clustering_enabled` and `exclude_duplicates` to `true`. Pass `false` explicitly
-on any of these to opt out.
+`include_nlp_data` and `include_translation_fields` to `true` (adds theme/sentiment/NER/summary and
+translation fields to each article). `search_articles` additionally defaults `clustering_enabled` and
+`exclude_duplicates` to `true`. Pass `false` explicitly on any of these to opt out.
+- All five tools that accept `fields` (`search_articles`, `get_latest_headlines`, `get_breaking_news`,
+  `search_by_author`, `search_by_link`) default it to a lean set instead of the full ~40-field object:
+  `title`, `link`, `published_date`, `domain_url`, `author`, `language`, `nlp.summary`,
+  `nlp.translation_summary`, `nlp.theme`. Pass `fields=[]` explicitly to get full, untrimmed objects —
+  do this when the user asks what else is available or wants to see everything. The default carries
+  both `nlp.summary` and `nlp.translation_summary` so non-English articles still get a usable summary
+  (only one of the two is normally populated on a given article — use whichever one is). Note:
+  `search_by_link` has no `include_translation_fields` toggle, so `nlp.translation_summary` is always
+  empty there; only `nlp.summary` populates.
 - Enabling `clustering_enabled` changes the response shape: you get `clusters_count` + `clusters`
   (each `{cluster_id, cluster_size, articles}`) instead of a flat `articles` list. Pass
   `clustering_enabled=false` if you just want a plain article list.
@@ -433,29 +443,45 @@ def _project_result(result: Any, fields: list[str] | None) -> Any:
     """Opt-in output projection. When `fields` is provided, trim every returned
     article -- a top-level `articles` list, articles nested under `clusters`, and
     articles nested under `breaking_news_events` (get_breaking_news's own shape)
-    -- to just those top-level keys. No-op when `fields` is None.
+    -- to just those keys. No-op when `fields` is falsy (None or []).
 
     News API v3 returns ~40 fields per article (plus large `all_links` /
     `all_domain_links` / `nlp` structures), which can blow an agent's context on a
     single call. This lets a caller ask for only what it needs (e.g.
     fields=["title","link","published_date","domain_url","description"]) without
-    changing behaviour for callers that don't pass it.
+    changing behaviour for callers that pass fields=[] to opt out.
+
+    Supports one level of dotting (e.g. "nlp.summary", "nlp.theme") the same way
+    build_source's server-side `_source` trim does -- get_breaking_news is the one
+    tool that uses this function instead of `_source` (its response shape has no
+    server-side equivalent), and DEFAULT_ARTICLE_FIELDS relies on dotted nlp.*
+    paths, so this has to understand them too or the whole `nlp` block would
+    silently disappear from get_breaking_news's default output.
 
     There is no top-level "summary" field on an article -- a common mistake.
-    Use "description" for the short lede, or the dotted path "nlp.summary" for
-    the AI-generated summary (requires `include_nlp_data=True`, the default) --
-    note this dotted form only works via build_source's server-side `_source`
-    trim, not here: this function only matches exact top-level keys, so nested
-    paths like "nlp.summary" won't trim get_breaking_news's response (there is
-    no server-side equivalent for that endpoint).
-    Requesting a field name that doesn't exist is silently dropped, not an error.
+    Use "description" for the short lede, or "nlp.summary" for the AI-generated
+    summary (requires `include_nlp_data=True`, the default). `validate_fields`
+    rejects an unrecognized name before this function ever runs, so there is no
+    silent-drop case left for a genuinely bad field name.
     """
     if not fields or not isinstance(result, dict):
         return result
-    keep = set(fields)
+    top_keys = {f for f in fields if "." not in f}
+    nested: dict[str, set[str]] = {}
+    for f in fields:
+        if "." in f:
+            parent, _, child = f.partition(".")
+            nested.setdefault(parent, set()).add(child)
 
     def proj(a: Any) -> Any:
-        return {k: v for k, v in a.items() if k in keep} if isinstance(a, dict) else a
+        if not isinstance(a, dict):
+            return a
+        out = {k: v for k, v in a.items() if k in top_keys}
+        for parent, children in nested.items():
+            sub = a.get(parent)
+            if isinstance(sub, dict):
+                out[parent] = {k: v for k, v in sub.items() if k in children}
+        return out
 
     if isinstance(result.get("articles"), list):
         result["articles"] = [proj(a) for a in result["articles"]]
@@ -529,7 +555,7 @@ async def search_articles(
     q: str,
     api_token: str = "",
     search_in: list[str] | None = None,
-    include_translation_fields: bool | None = None,
+    include_translation_fields: bool | None = True,
     predefined_sources: list[str] | None = None,
     source_name: str | None = None,
     sources: list[str] | None = None,
@@ -580,7 +606,7 @@ async def search_articles(
     custom_tags: dict[str, list[str]] | None = None,
     exclude_duplicates: bool | None = True,
     robots_compliant: bool | None = None,
-    fields: list[str] | None = None,
+    fields: list[str] | None = DEFAULT_ARTICLE_FIELDS,
 ) -> str:
     """
     Full-text/boolean keyword search over global news articles. The richest tool
@@ -595,15 +621,20 @@ async def search_articles(
     - clustering_enabled, exclude_duplicates, and include_nlp_data all default to
       true for richer, deduplicated, NLP-enriched results -- pass false to opt out
       of any of them. clustering_enabled changes the response shape (see Returns).
-    - fields: pass a list of article keys (e.g. ["title","link","published_date",
-      "domain_url","description","nlp"]) to trim each returned article to just
-      those -- News API v3 returns ~40 fields per article (the biggest being the
-      large all_links/all_domain_links/all_links_text arrays), so this keeps
-      large, enriched result sets within an agent's context budget. Omit for full
-      objects. There is no top-level "summary" field -- use "description" for the
-      short lede, or the dotted path "nlp.summary" for the AI-generated summary
-      (needs include_nlp_data=True, the default); an unknown field name is
-      silently dropped, not an error.
+    - `fields` defaults to a lean, generally-useful set -- title, link,
+      published_date, domain_url, author, language, nlp.summary,
+      nlp.translation_summary, nlp.theme -- instead of the full ~40-field object
+      (the biggest being the all_links/all_domain_links/all_links_text arrays and
+      the full `content` body), keeping ordinary result sets within an agent's
+      context budget without extra effort. Pass `fields=[]` explicitly to opt out
+      and get full objects (e.g. the user asks what else is available, or wants
+      to see everything). The default includes both `nlp.summary` and
+      `nlp.translation_summary` (needs include_translation_fields=True, also the
+      default) so non-English articles still get a usable summary -- when
+      presenting results, use whichever of the two is actually populated. There
+      is no top-level "summary" field; passing a custom `fields` list with an
+      unrecognized name returns an immediate corrective error instead of
+      silently vanishing from the response.
     - Hard cap: 10,000 matched articles per query regardless of pagination. Call
       get_aggregation_count first on broad/undated queries to measure actual volume
       and time-chunk the date range accordingly (denser topics need hourly chunks,
@@ -639,7 +670,9 @@ async def search_articles(
             this server's instructions).
         include_translation_fields: Add title_translated_en/content_translated_en and
             nlp.translation_summary/translation_ner_* to results (needs include_nlp_data
-            too for the nlp.* fields). See this server's instructions for multilingual tips.
+            too for the nlp.* fields). Defaults to True -- this is also what populates
+            nlp.translation_summary in the default `fields` set for non-English
+            articles. See this server's instructions for multilingual tips.
         predefined_sources: Top-N sources per country, e.g. ["top 50 US", "top 20 GB"].
             Use when the user wants "top"/"major"/"reputable" sources for a country
             rather than a specific list -- prefer this over enumerating domains by
@@ -856,7 +889,7 @@ async def get_latest_headlines(
     clustering_enabled: bool | None = True,
     clustering_variable: str | None = None,
     clustering_threshold: float | None = None,
-    include_translation_fields: bool | None = None,
+    include_translation_fields: bool | None = True,
     include_nlp_data: bool | None = True,
     has_nlp: bool | None = None,
     theme: list[str] | None = None,
@@ -871,7 +904,7 @@ async def get_latest_headlines(
     content_sentiment_max: float | None = None,
     custom_tags: dict[str, list[str]] | None = None,
     robots_compliant: bool | None = None,
-    fields: list[str] | None = None,
+    fields: list[str] | None = DEFAULT_ARTICLE_FIELDS,
 ) -> str:
     """
     Recent headlines over a rolling time window -- no keyword query required.
@@ -929,7 +962,9 @@ async def get_latest_headlines(
         clustering_threshold: Similarity threshold in (0, 1], default 0.7.
         include_translation_fields: Add title_translated_en/content_translated_en and
             nlp.translation_summary/translation_ner_* to results (needs include_nlp_data
-            too for the nlp.* fields). See this server's instructions for multilingual tips.
+            too for the nlp.* fields). Defaults to True -- this is also what populates
+            nlp.translation_summary in the default `fields` set for non-English
+            articles. See this server's instructions for multilingual tips.
         include_nlp_data: Populate each article's `nlp` block. Defaults to True.
         has_nlp: Filter to only articles that have NLP data (indexed July 2023+).
         theme: Filter to these themes -- open vocabulary, not a hard enum.
@@ -1035,7 +1070,7 @@ async def get_breaking_news(
     page: int = 1,
     page_size: int = 100,
     top_n_articles: int | None = None,
-    include_translation_fields: bool | None = None,
+    include_translation_fields: bool | None = True,
     include_nlp_data: bool | None = True,
     has_nlp: bool | None = None,
     theme: list[str] | None = None,
@@ -1048,7 +1083,7 @@ async def get_breaking_news(
     title_sentiment_max: float | None = None,
     content_sentiment_min: float | None = None,
     content_sentiment_max: float | None = None,
-    fields: list[str] | None = None,
+    fields: list[str] | None = DEFAULT_ARTICLE_FIELDS,
 ) -> str:
     """
     Actively-trending news event clusters, ordered by how heavily each is covered.
@@ -1082,7 +1117,9 @@ async def get_breaking_news(
             top_n_articles * page_size must not exceed 1000.
         include_translation_fields: Add title_translated_en/content_translated_en and
             nlp.translation_summary/translation_ner_* to results (needs include_nlp_data
-            too for the nlp.* fields). See this server's instructions for multilingual tips.
+            too for the nlp.* fields). Defaults to True -- this is also what populates
+            nlp.translation_summary in the default `fields` set for non-English
+            articles. See this server's instructions for multilingual tips.
         include_nlp_data: Populate each article's `nlp` block. Defaults to True.
         has_nlp: Filter to only articles that have NLP data (indexed July 2023+).
         theme: Filter to these themes -- open vocabulary, not a hard enum.
@@ -1179,7 +1216,7 @@ async def search_by_author(
     word_count_max: int | None = None,
     page: int = 1,
     page_size: int = 100,
-    include_translation_fields: bool | None = None,
+    include_translation_fields: bool | None = True,
     include_nlp_data: bool | None = True,
     has_nlp: bool | None = None,
     theme: list[str] | None = None,
@@ -1191,7 +1228,7 @@ async def search_by_author(
     content_sentiment_max: float | None = None,
     custom_tags: dict[str, list[str]] | None = None,
     robots_compliant: bool | None = None,
-    fields: list[str] | None = None,
+    fields: list[str] | None = DEFAULT_ARTICLE_FIELDS,
 ) -> str:
     """
     All articles written by one specific byline (exact match).
@@ -1240,7 +1277,9 @@ async def search_by_author(
         page_size: Results per page, max 1000. Defaults to 100.
         include_translation_fields: Add title_translated_en/content_translated_en and
             nlp.translation_summary/translation_ner_* to results (needs include_nlp_data
-            too for the nlp.* fields). See this server's instructions for multilingual tips.
+            too for the nlp.* fields). Defaults to True -- this is also what populates
+            nlp.translation_summary in the default `fields` set for non-English
+            articles. See this server's instructions for multilingual tips.
         include_nlp_data: Populate each article's `nlp` block. Defaults to True.
         has_nlp: Filter to only articles that have NLP data (indexed July 2023+).
         theme: Filter to these themes -- open vocabulary, not a hard enum.
@@ -1339,7 +1378,7 @@ async def search_by_link(
     page: int = 1,
     page_size: int = 100,
     robots_compliant: bool | None = None,
-    fields: list[str] | None = None,
+    fields: list[str] | None = DEFAULT_ARTICLE_FIELDS,
 ) -> str:
     """
     Look up specific, already-known articles by NewsCatcher id or URL.

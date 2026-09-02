@@ -298,6 +298,27 @@ NLP_SUBFIELDS = frozenset(
     """.split()
 )
 
+# Server-enforced default `fields` value for search_articles/get_latest_headlines/
+# get_breaking_news/search_by_author/search_by_link -- applied whenever a caller
+# omits `fields`, trimming the ~40-field article object down to a lean, generally-
+# useful default instead of returning everything. Includes both nlp.summary and
+# nlp.translation_summary so non-English articles still get a usable summary field
+# (nlp.translation_summary is empty unless include_translation_fields=True, which
+# these tools also default to True) -- when displaying results, use whichever of
+# the two is actually populated. Pass fields=[] explicitly to opt out and get the
+# full, untrimmed object (e.g. when the user wants to see everything available).
+DEFAULT_ARTICLE_FIELDS: list[str] = [
+    "title",
+    "link",
+    "published_date",
+    "domain_url",
+    "author",
+    "language",
+    "nlp.summary",
+    "nlp.translation_summary",
+    "nlp.theme",
+]
+
 # Known naming traps: a value a caller would reasonably guess exists but
 # doesn't, mapped to what to use instead.
 _FIELD_HINTS: dict[str, str] = {

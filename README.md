@@ -124,9 +124,13 @@ forwards HTTP headers to the backend but **not** URL query parameters. Use the
   Hausa, etc. services too, not just BBC English — combine with `lang=["en"]`
   when "BBC's headlines" means the English edition.
 - **Defaults favor richer results.** `search_articles` defaults `clustering_enabled`,
-  `exclude_duplicates`, and `include_nlp_data` to `true`; `get_latest_headlines`,
-  `get_breaking_news`, and `search_by_author` default `include_nlp_data` to `true`.
-  Pass `false` explicitly to opt out of any of these.
+  `exclude_duplicates`, `include_nlp_data`, and `include_translation_fields` to
+  `true`; `get_latest_headlines`, `get_breaking_news`, and `search_by_author`
+  default `include_nlp_data` and `include_translation_fields` to `true`.
+  Pass `false` explicitly to opt out of any of these. All five tools that accept
+  `fields` (the four above plus `search_by_link`) also default it to a lean set
+  instead of the full object — see [Output Projection](#output-projection-fields)
+  below; pass `fields=[]` to opt out.
   - `clustering_enabled=true` changes the response shape to `clusters_count` +
     `clusters` (each `{cluster_id, cluster_size, articles}`) instead of a flat
     `articles` list — pass `clustering_enabled=false` for a plain list.
@@ -264,14 +268,28 @@ requests still need only one well-formed call.
 
 ## Output Projection (`fields`)
 
-Pass `fields` (a list of article keys) to `search_articles`, `get_latest_headlines`,
-`get_breaking_news`, `search_by_author`, or `search_by_link` to trim each returned
-article to just those keys. News API v3 returns ~40 fields per article — the
-`content` body alone can make a 30-article call exceed 300 KB / ~80K tokens — so
-this keeps large, enriched result sets within an agent's context budget. Omit it
-for full objects; this is purely an MCP-server convenience, not a News API v3
-parameter (it compiles down to the API's `_source` mechanism internally).
+`fields` (a list of article keys) trims each returned article to just those keys,
+on `search_articles`, `get_latest_headlines`, `get_breaking_news`,
+`search_by_author`, and `search_by_link`. News API v3 returns ~40 fields per
+article — the `content` body alone can make a 30-article call exceed 300 KB /
+~80K tokens — so this keeps result sets within an agent's context budget. This is
+purely an MCP-server convenience, not a News API v3 parameter (it compiles down
+to the API's `_source` mechanism internally, except on `get_breaking_news`, which
+trims client-side since that endpoint has no `_source` equivalent).
 
+- **Defaults to a lean, generally-useful set** — `title`, `link`,
+  `published_date`, `domain_url`, `author`, `language`, `nlp.summary`,
+  `nlp.translation_summary`, `nlp.theme` — instead of the full object. Pass
+  `fields=[]` explicitly to opt out and get everything (e.g. the user asks what
+  else is available, or wants to see everything).
+- The default carries both `nlp.summary` and `nlp.translation_summary` so
+  non-English articles still get a usable summary — News API only populates one
+  of the two per article (the other is `null`/absent), so when presenting
+  results, use whichever one is actually populated.
+  `nlp.translation_summary` needs `include_translation_fields=true`, which
+  these tools also default to `true`. `search_by_link` has no
+  `include_translation_fields` toggle, so `nlp.translation_summary` is always
+  empty there.
 - Field names are validated against the real article schema before the request is
   sent — an unrecognized name (e.g. assuming a top-level `"summary"` field exists)
   returns an immediate corrective error instead of silently vanishing from the

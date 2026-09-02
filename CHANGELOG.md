@@ -33,6 +33,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   corrective error (e.g. pointing to `"description"` or `"nlp.summary"`
   instead of `"summary"`).
 
+### Changed
+- `fields` now defaults to a lean, generally-useful set instead of the full
+  ~40-field article object, on all 5 tools that accept it (`search_articles`,
+  `get_latest_headlines`, `get_breaking_news`, `search_by_author`,
+  `search_by_link`): `title`, `link`, `published_date`, `domain_url`, `author`,
+  `language`, `nlp.summary`, `nlp.translation_summary`, `nlp.theme`
+  (`validators.DEFAULT_ARTICLE_FIELDS`). This is a real behavior change for
+  every caller that omits `fields` -- output is now trimmed by default rather
+  than the full object. Pass `fields=[]` explicitly to opt back into full,
+  untrimmed objects (e.g. the user asks what else is available).
+- `include_translation_fields` now defaults to `true` on `search_articles`,
+  `get_latest_headlines`, `get_breaking_news`, and `search_by_author` (previously
+  unset/off) -- needed so `nlp.translation_summary` in the new default `fields`
+  set actually populates for non-English articles. News API only populates one
+  of `nlp.summary`/`nlp.translation_summary` per article; present it as
+  whichever one is actually non-null. `search_by_link` has no such toggle and
+  always leaves `nlp.translation_summary` empty.
+- `_project_result` (the client-side trim `get_breaking_news` uses instead of
+  the other four tools' server-side `_source`) now supports one level of dotted
+  paths (e.g. `"nlp.summary"`), matching what `build_source` already supported
+  -- needed for the new default's `nlp.*` fields to actually trim
+  `get_breaking_news`'s output instead of silently dropping the whole `nlp`
+  block (its response shape has no `_source` equivalent).
+
 ### Docs
 - README now leads with the hosted deployment
   (`https://news-mcp.newscatcherapi.com/mcp`) instead of "no hosted deployment
@@ -71,7 +95,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Tests
 - Live integration run against the hosted deployment (43/43 passing) plus new
   regression coverage for comma-joined list-field serialization, `fields`
-  validation (unit + integration), and `get_breaking_news` fields projection.
+  validation (unit + integration), `get_breaking_news` fields projection, the
+  new default `fields`/`include_translation_fields` values end-to-end per tool,
+  the `fields=[]` escape hatch, and `_project_result`'s dotted-path support.
 
 ##  [0.3.0] — 2026-07-20
 

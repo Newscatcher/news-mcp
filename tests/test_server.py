@@ -401,12 +401,15 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_request_mapping(self) -> None:
         # search_articles/get_latest_headlines/get_breaking_news/search_by_author default
-        # clustering_enabled/exclude_duplicates/include_nlp_data to True -- these keys are
-        # expected in every request body for those tools even when the caller omits them.
+        # clustering_enabled/exclude_duplicates/include_nlp_data/include_translation_fields
+        # to True -- these keys are expected in every request body for those tools even
+        # when the caller omits them. All five fields-accepting tools also default `fields`
+        # to DEFAULT_ARTICLE_FIELDS (see test_default_fields_applied_when_omitted below) --
+        # these cases pass fields=[] to opt out and isolate what they're actually testing.
         cases = [
             (
                 server.search_articles,
-                {"q": "acquisitions"},
+                {"q": "acquisitions", "fields": []},
                 "/api/search",
                 {
                     "q": "acquisitions",
@@ -414,12 +417,20 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     "page_size": 100,
                     "clustering_enabled": True,
                     "include_nlp_data": True,
+                    "include_translation_fields": True,
                     "exclude_duplicates": True,
                 },
             ),
             (
                 server.search_articles,
-                {"q": "ai", "lang": ["en", "es"], "page": 2, "page_size": 50, "sort_by": "date"},
+                {
+                    "q": "ai",
+                    "lang": ["en", "es"],
+                    "page": 2,
+                    "page_size": 50,
+                    "sort_by": "date",
+                    "fields": [],
+                },
                 "/api/search",
                 {
                     "q": "ai",
@@ -429,18 +440,25 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     "sort_by": "date",
                     "clustering_enabled": True,
                     "include_nlp_data": True,
+                    "include_translation_fields": True,
                     "exclude_duplicates": True,
                 },
             ),
             (
                 server.get_latest_headlines,
-                {},
+                {"fields": []},
                 "/api/latest_headlines",
-                {"page": 1, "page_size": 100, "clustering_enabled": True, "include_nlp_data": True},
+                {
+                    "page": 1,
+                    "page_size": 100,
+                    "clustering_enabled": True,
+                    "include_nlp_data": True,
+                    "include_translation_fields": True,
+                },
             ),
             (
                 server.get_latest_headlines,
-                {"when": "24h", "countries": ["US"]},
+                {"when": "24h", "countries": ["US"], "fields": []},
                 "/api/latest_headlines",
                 {
                     "page": 1,
@@ -449,35 +467,49 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     "countries": ["US"],
                     "clustering_enabled": True,
                     "include_nlp_data": True,
+                    "include_translation_fields": True,
                 },
             ),
             (
                 server.get_breaking_news,
                 {},
                 "/api/breaking_news",
-                {"page": 1, "page_size": 100, "include_nlp_data": True},
+                {"page": 1, "page_size": 100, "include_nlp_data": True, "include_translation_fields": True},
             ),
             (
                 server.get_breaking_news,
                 {"top_n_articles": 5, "sort_by": "rank"},
                 "/api/breaking_news",
-                {"page": 1, "page_size": 100, "top_n_articles": 5, "sort_by": "rank", "include_nlp_data": True},
+                {
+                    "page": 1,
+                    "page_size": 100,
+                    "top_n_articles": 5,
+                    "sort_by": "rank",
+                    "include_nlp_data": True,
+                    "include_translation_fields": True,
+                },
             ),
             (
                 server.search_by_author,
-                {"author_name": "Jane Doe"},
+                {"author_name": "Jane Doe", "fields": []},
                 "/api/authors",
-                {"author_name": "Jane Doe", "page": 1, "page_size": 100, "include_nlp_data": True},
+                {
+                    "author_name": "Jane Doe",
+                    "page": 1,
+                    "page_size": 100,
+                    "include_nlp_data": True,
+                    "include_translation_fields": True,
+                },
             ),
             (
                 server.search_by_link,
-                {"ids": ["abc123"]},
+                {"ids": ["abc123"], "fields": []},
                 "/api/search_by_link",
                 {"page": 1, "page_size": 100, "ids": ["abc123"]},
             ),
             (
                 server.search_by_link,
-                {"links": ["https://example.com/article"]},
+                {"links": ["https://example.com/article"], "fields": []},
                 "/api/search_by_link",
                 {"page": 1, "page_size": 100, "links": ["https://example.com/article"]},
             ),
@@ -507,7 +539,7 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
             # must be sent as a comma-joined string, not a list.
             (
                 server.search_articles,
-                {"q": "ai", "search_in": ["title", "summary"]},
+                {"q": "ai", "search_in": ["title", "summary"], "fields": []},
                 "/api/search",
                 {
                     "q": "ai",
@@ -516,12 +548,13 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     "search_in": "title,summary",
                     "clustering_enabled": True,
                     "include_nlp_data": True,
+                    "include_translation_fields": True,
                     "exclude_duplicates": True,
                 },
             ),
             (
                 server.search_articles,
-                {"q": "ai", "theme": ["Business"], "not_theme": ["Sports"]},
+                {"q": "ai", "theme": ["Business"], "not_theme": ["Sports"], "fields": []},
                 "/api/search",
                 {
                     "q": "ai",
@@ -531,12 +564,13 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     "not_theme": "Sports",
                     "clustering_enabled": True,
                     "include_nlp_data": True,
+                    "include_translation_fields": True,
                     "exclude_duplicates": True,
                 },
             ),
             (
                 server.search_articles,
-                {"q": "ai", "predefined_sources": ["top 100 US", "top 50 GB"]},
+                {"q": "ai", "predefined_sources": ["top 100 US", "top 50 GB"], "fields": []},
                 "/api/search",
                 {
                     "q": "ai",
@@ -545,6 +579,7 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     "predefined_sources": "top 100 US,top 50 GB",
                     "clustering_enabled": True,
                     "include_nlp_data": True,
+                    "include_translation_fields": True,
                     "exclude_duplicates": True,
                 },
             ),
@@ -552,6 +587,90 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
         for tool_func, kwargs, expected_path, expected_json in cases:
             with self.subTest(tool=tool_func.__name__, kwargs=kwargs):
                 await self._assert_tool_call(tool_func, kwargs, expected_path, expected_json)
+
+    async def test_default_fields_applied_when_omitted(self) -> None:
+        """DEFAULT_ARTICLE_FIELDS is the server-enforced default for every
+        fields-accepting tool when the caller simply omits `fields` -- verify the
+        actual _source/include_translation_fields values this produces, for both
+        the clustered and flat build_source prefixes."""
+        expected_flat_source = server.build_source(validators.DEFAULT_ARTICLE_FIELDS, clustered=False)
+        expected_clustered_source = server.build_source(validators.DEFAULT_ARTICLE_FIELDS, clustered=True)
+
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.search_articles)(q="ai")  # clustering_enabled defaults True
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["_source"], expected_clustered_source)
+        self.assertIs(called["include_translation_fields"], True)
+
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.get_latest_headlines)()  # clustering_enabled defaults True too
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["_source"], expected_clustered_source)
+        self.assertIs(called["include_translation_fields"], True)
+
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.search_by_author)(author_name="Jane Doe")  # no clustering param
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["_source"], expected_flat_source)
+        self.assertIs(called["include_translation_fields"], True)
+
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.search_by_link)(ids=["abc123"])
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["_source"], expected_flat_source)
+        self.assertNotIn("include_translation_fields", called)  # no such param on this tool
+
+    async def test_default_fields_trims_breaking_news_output(self) -> None:
+        """get_breaking_news uses _project_result (client-side trim) instead of
+        _source -- verify the default actually trims the RETURNED article,
+        including the dotted nlp.* paths in DEFAULT_ARTICLE_FIELDS."""
+        raw = {
+            "breaking_news_events": [
+                {
+                    "event_id": "e1",
+                    "articles_count": 1,
+                    "articles": [
+                        {
+                            "title": "t",
+                            "link": "l",
+                            "published_date": "d",
+                            "domain_url": "x.com",
+                            "author": "a",
+                            "language": "en",
+                            "content": "big body text",
+                            "nlp": {
+                                "summary": "s",
+                                "translation_summary": None,
+                                "theme": "Business",
+                                "sentiment": 0.1,
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = raw
+            result = await _unwrap(server.get_breaking_news)()
+        data = json.loads(result)
+        art = data["breaking_news_events"][0]["articles"][0]
+        self.assertEqual(
+            set(art.keys()),
+            {"title", "link", "published_date", "domain_url", "author", "language", "nlp"},
+        )
+        self.assertEqual(art["nlp"], {"summary": "s", "translation_summary": None, "theme": "Business"})
+
+    async def test_fields_empty_list_opts_out_of_default(self) -> None:
+        """fields=[] is the documented escape hatch back to full, untrimmed objects."""
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.search_articles)(q="ai", fields=[])
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertNotIn("_source", called)
 
     async def test_search_articles_defaults_can_be_disabled(self) -> None:
         """Passing False explicitly overrides the clustering/dedup/NLP defaults."""
@@ -694,6 +813,25 @@ class ProjectResultTests(unittest.TestCase):
         }
         out = server._project_result(r, ["title"])
         self.assertEqual(out["breaking_news_events"][0]["articles"][0], {"title": "t"})
+
+    def test_projects_dotted_nlp_subfields(self) -> None:
+        """Regression: DEFAULT_ARTICLE_FIELDS uses dotted nlp.* paths for
+        get_breaking_news's client-side trim (the only tool where _source doesn't
+        apply) -- _project_result must understand one level of dotting, not just
+        exact top-level keys, or the whole `nlp` block would silently vanish from
+        the default output."""
+        r = {
+            "articles": [
+                {"title": "t", "nlp": {"summary": "s", "theme": "Business", "sentiment": 0.5}}
+            ]
+        }
+        out = server._project_result(r, ["title", "nlp.summary", "nlp.theme"])
+        self.assertEqual(out["articles"][0], {"title": "t", "nlp": {"summary": "s", "theme": "Business"}})
+
+    def test_projects_dotted_path_missing_parent_is_noop(self) -> None:
+        r = {"articles": [{"title": "t"}]}
+        out = server._project_result(r, ["title", "nlp.summary"])
+        self.assertEqual(out["articles"][0], {"title": "t"})
 
 
 class BuildSourceTests(unittest.TestCase):

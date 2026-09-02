@@ -39,7 +39,10 @@ class TestSearchByLink:
         pytest.fail(f"All {len(articles)} candidate links were rejected: {errors}")
 
     async def test_lookup_by_id(self, mcp):
-        search_result = await mcp.call_tool("search_articles", {"q": "news", "page_size": 1})
+        # DEFAULT_ARTICLE_FIELDS doesn't include "id" -- request it explicitly.
+        search_result = await mcp.call_tool(
+            "search_articles", {"q": "news", "page_size": 1, "fields": ["id"]}
+        )
         _data = call_result_json(search_result)
         articles = _data.get("articles") or _data.get("clusters", [{}])[0].get("articles", [])
         assert articles, "Expected at least one article from search_articles to look up"
