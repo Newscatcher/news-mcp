@@ -316,6 +316,15 @@ class ValidationHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validators.validate_clustering_threshold(1.5)
 
+    def test_validate_cluster_top_n_articles(self) -> None:
+        validators.validate_cluster_top_n_articles(1)
+        validators.validate_cluster_top_n_articles(3)
+        validators.validate_cluster_top_n_articles(None)  # no cap
+        with self.assertRaises(ValueError):
+            validators.validate_cluster_top_n_articles(0)
+        with self.assertRaises(ValueError):
+            validators.validate_cluster_top_n_articles(-1)
+
     def test_validate_sources_params(self) -> None:
         validators.validate_sources_params(None, None)
         validators.validate_sources_params(["bbc.com"], True)
@@ -387,13 +396,21 @@ def _unwrap(tool_func):
     return tool_func.fn if hasattr(tool_func, "fn") else tool_func
 
 
+# Tools whose output is meant to be read directly by a human (quota checks,
+# liveness pings) keep indent=2; every other tool's output is model-consumed
+# only, so json.dumps drops indent=2 there to cut ~17% of tokens off every
+# response for no loss in meaning.
+PRETTY_PRINTED_TOOLS = {"get_subscription", "check_health"}
+
+
 class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def _assert_tool_call(self, tool_func, tool_kwargs: dict, expected_path: str, expected_json) -> None:
         with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
             mock_api.return_value = {"ok": True}
             result = await _unwrap(tool_func)(**tool_kwargs)
 
-        self.assertEqual(result, json.dumps({"ok": True}, indent=2))
+        expected_indent = 2 if tool_func.__name__ in PRETTY_PRINTED_TOOLS else None
+        self.assertEqual(result, json.dumps({"ok": True}, indent=expected_indent))
         mock_api.assert_awaited_once()
         called = mock_api.await_args.kwargs
         self.assertEqual(called["path"], expected_path)
@@ -414,7 +431,7 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "q": "acquisitions",
                     "page": 1,
-                    "page_size": 100,
+                    "page_size": 50,
                     "clustering_enabled": True,
                     "include_nlp_data": True,
                     "include_translation_fields": True,
@@ -450,7 +467,7 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 "/api/latest_headlines",
                 {
                     "page": 1,
-                    "page_size": 100,
+                    "page_size": 50,
                     "clustering_enabled": True,
                     "include_nlp_data": True,
                     "include_translation_fields": True,
@@ -462,7 +479,7 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 "/api/latest_headlines",
                 {
                     "page": 1,
-                    "page_size": 100,
+                    "page_size": 50,
                     "when": "24h",
                     "countries": ["US"],
                     "clustering_enabled": True,
@@ -544,7 +561,7 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "q": "ai",
                     "page": 1,
-                    "page_size": 100,
+                    "page_size": 50,
                     "search_in": "title,summary",
                     "clustering_enabled": True,
                     "include_nlp_data": True,
@@ -559,7 +576,7 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "q": "ai",
                     "page": 1,
-                    "page_size": 100,
+                    "page_size": 50,
                     "theme": "Business",
                     "not_theme": "Sports",
                     "clustering_enabled": True,
@@ -575,7 +592,7 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "q": "ai",
                     "page": 1,
-                    "page_size": 100,
+                    "page_size": 50,
                     "predefined_sources": "top 100 US,top 50 GB",
                     "clustering_enabled": True,
                     "include_nlp_data": True,
@@ -664,6 +681,60 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(art["nlp"], {"summary": "s", "translation_summary": None, "theme": "Business"})
 
+    async def test_cluster_top_n_articles_caps_clusters_client_side(self) -> None:
+        """cluster_top_n_articles trims each cluster's `articles` list client-side
+        (News API has no server-side equivalent for search_articles/
+        get_latest_headlines, unlike get_breaking_news's native top_n_articles)
+        while leaving `cluster_size` untouched, and is never sent upstream -- it's
+        a pure post-processing step on the response, not a request parameter."""
+        raw = {
+            "clusters_count": 2,
+            "clusters": [
+                {"cluster_id": "c1", "cluster_size": 5, "articles": [{"title": f"a{i}"} for i in range(5)]},
+                {"cluster_id": "c2", "cluster_size": 1, "articles": [{"title": "b0"}]},
+            ],
+        }
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = raw
+            result = await _unwrap(server.search_articles)(q="ai")  # default cluster_top_n_articles=3
+        data = json.loads(result)
+        self.assertEqual(len(data["clusters"][0]["articles"]), 3)
+        self.assertEqual(data["clusters"][0]["cluster_size"], 5)  # untouched -- true total still visible
+        self.assertEqual(len(data["clusters"][1]["articles"]), 1)  # already under the cap
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertNotIn("cluster_top_n_articles", called)
+
+    async def test_cluster_top_n_articles_none_disables_cap(self) -> None:
+        raw = {
+            "clusters_count": 1,
+            "clusters": [{"cluster_id": "c1", "cluster_size": 5, "articles": [{"title": f"a{i}"} for i in range(5)]}],
+        }
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = raw
+            result = await _unwrap(server.search_articles)(q="ai", cluster_top_n_articles=None)
+        data = json.loads(result)
+        self.assertEqual(len(data["clusters"][0]["articles"]), 5)
+
+    async def test_cluster_top_n_articles_noop_when_clustering_disabled(self) -> None:
+        """No `clusters` key when clustering_enabled=False -- nothing to trim, no error."""
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"articles": [{"title": "a"}]}
+            result = await _unwrap(server.search_articles)(q="ai", clustering_enabled=False)
+        data = json.loads(result)
+        self.assertEqual(data["articles"], [{"title": "a"}])
+
+    async def test_cluster_top_n_articles_applies_to_get_latest_headlines(self) -> None:
+        raw = {
+            "clusters_count": 1,
+            "clusters": [{"cluster_id": "c1", "cluster_size": 4, "articles": [{"title": f"a{i}"} for i in range(4)]}],
+        }
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = raw
+            result = await _unwrap(server.get_latest_headlines)()  # default cluster_top_n_articles=3
+        data = json.loads(result)
+        self.assertEqual(len(data["clusters"][0]["articles"]), 3)
+        self.assertEqual(data["clusters"][0]["cluster_size"], 4)
+
     async def test_fields_empty_list_opts_out_of_default(self) -> None:
         """fields=[] is the documented escape hatch back to full, untrimmed objects."""
         with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
@@ -730,6 +801,8 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
             (server.search_articles, {"q": "ai", "search_in": ["title", "content", "summary"]}, "at most 2 values"),
             (server.search_articles, {"q": "ai", "title_sentiment_min": 2.0}, "must be between -1.0 and 1.0"),
             (server.search_articles, {"q": "ai", "clustering_threshold": 0}, "must be in (0, 1]"),
+            (server.search_articles, {"q": "ai", "cluster_top_n_articles": 0}, "must be >= 1"),
+            (server.get_latest_headlines, {"cluster_top_n_articles": -1}, "must be >= 1"),
             (server.search_articles, {"q": "ai", "from_rank": 0}, "must be between 1 and 999999"),
             (server.get_breaking_news, {"top_n_articles": 20}, "exceeds the maximum of 1000"),
             (server.get_aggregation_count, {"q": "ai", "aggregation_by": "week"}, "aggregation_by must be one of"),

@@ -6,10 +6,21 @@ content via the NewsCatcher News API.
 
 API token precedence (highest to lowest):
 1. api_token tool parameter (explicit per-call)
-2. x-api-token request header (recommended for hosted/gateway deployments)
-3. Authorization: Bearer <token> request header
-4. URL query parameter: ?apiToken=YOUR_TOKEN
+2. URL query parameter: ?apiToken=YOUR_TOKEN (direct server access only -- see below)
+3. x-api-token request header (recommended for hosted/gateway deployments)
+4. Authorization: Bearer <token> request header
 5. NEWS_API_KEY environment variable
+
+Note: ?apiToken= outranks the header options, not the other way around. The
+ASGI middleware below captures ?apiToken= into a ContextVar on any request
+that carries it, and _token_from_session() reads that ContextVar before it
+ever inspects headers -- so if a direct-server-access request (or that
+session's original `initialize` request) included ?apiToken=, it wins over
+an x-api-token/Authorization header sent on the same or a later request in
+that session. This does not affect gateway deployments (e.g. fastmcp.app):
+the gateway forwards headers but not URL query parameters, so ?apiToken=
+never reaches this server in that setup and the header is effectively
+highest priority there.
 """
 
 from __future__ import annotations
@@ -37,6 +48,7 @@ from validators import (
     flatten_custom_tags,
     lint_query,
     validate_choice,
+    validate_cluster_top_n_articles,
     validate_clustering_threshold,
     validate_country,
     validate_fields,
@@ -128,9 +140,14 @@ check_health never calls the upstream API and never needs a token.
 ## Authentication
 API token is resolved in this order (first match wins):
 1. `api_token` tool parameter — pass it directly in any tool call.
-2. `x-api-token` HTTP header — set once in your MCP client config (recommended for hosted deployments).
-3. `Authorization: Bearer <token>` HTTP header — alternative header-based auth.
-4. `?apiToken=YOUR_TOKEN` URL query parameter — works only for direct server access (not forwarded by the FastMCP Gateway).
+2. `?apiToken=YOUR_TOKEN` URL query parameter — direct server access only (not forwarded by the
+   FastMCP Gateway). If present on a request, it outranks the `x-api-token`/`Authorization` headers
+   below, including on later requests in the same session if it was on that session's `initialize`
+   request.
+3. `x-api-token` HTTP header — set once in your MCP client config (recommended for hosted deployments).
+   Effectively the top priority when accessed through the FastMCP Gateway, since `?apiToken=` never
+   reaches this server there.
+4. `Authorization: Bearer <token>` HTTP header — alternative header-based auth.
 5. `NEWS_API_KEY` environment variable — set on the server host.
 If no token is found, tools return `Error: API token is required.`
 
@@ -163,10 +180,24 @@ translation fields to each article). `search_articles` additionally defaults `cl
 - Enabling `clustering_enabled` changes the response shape: you get `clusters_count` + `clusters`
   (each `{cluster_id, cluster_size, articles}`) instead of a flat `articles` list. Pass
   `clustering_enabled=false` if you just want a plain article list.
+- `search_articles`/`get_latest_headlines` default to `clustering_enabled=true`, `page_size=50`, and
+  `cluster_top_n_articles=3` -- tuned for a broad/basic request (grouped topic coverage without
+  flooding the response). When the user wants direct articles or cares about specific sources instead
+  of grouped coverage (tracking one outlet, precise source-checking, "did X cover this"), pass
+  `clustering_enabled=false` and `page_size=20` for a plain, ungrouped list -- otherwise the specific
+  article/source they're after could be hidden by the `cluster_top_n_articles` cap if it isn't among
+  the top 3 in its cluster.
+- Clustering reorganizes results, it doesn't shrink them: News API groups all matched articles into
+  clusters, it doesn't drop any -- page_size=50 grouped into 25 clusters is still ~50 full article
+  objects on the wire. `cluster_top_n_articles` (search_articles/get_latest_headlines only) caps each
+  cluster's `articles` list client-side, default 3, so one heavily-syndicated story's cluster can't
+  fill the whole response with near-duplicate coverage. `cluster_size` stays the true total either way;
+  pass `cluster_top_n_articles=None` for no cap.
 - Clustering and `exclude_duplicates` address the same underlying problem (near-duplicate coverage)
-  differently, rather than being strictly complementary: clustering groups related articles (all
-  articles kept, reorganized into groups), `exclude_duplicates` removes near-identical ones (fewer
-  articles, stays flat, adds `duplicate_count`/`duplicate_articles_group_id` per result).
+  differently, rather than being strictly complementary: clustering groups related articles (kept,
+  reorganized into groups, then capped per-cluster by `cluster_top_n_articles` as above),
+  `exclude_duplicates` removes near-identical ones outright (fewer articles, stays flat, adds
+  `duplicate_count`/`duplicate_articles_group_id` per result).
 - Keep `exclude_duplicates=true` (the default) for most queries -- it's the right default because
   most callers want distinct stories, not every syndication of the same wire copy. Override to
   `false` only when: (a) the user explicitly asks to include duplicates/reprints, or (b) the goal is
@@ -327,8 +358,10 @@ def get_api_token(api_token: str = "") -> str:
 
     Priority order:
     1. api_token parameter (explicit in tool call)
-    2. x-api-token header or Authorization: Bearer header (via _token_from_session)
-    3. ?apiToken= URL query parameter (direct server access only)
+    2. ?apiToken= URL query parameter (direct server access only -- via
+       _token_from_session's session_api_token ContextVar, checked before
+       headers; see that function's docstring)
+    3. x-api-token header or Authorization: Bearer header (via _token_from_session)
     4. NEWS_API_KEY environment variable
 
     Every News API v3 endpoint requires auth -- there is no public no-auth
@@ -496,6 +529,32 @@ def _project_result(result: Any, fields: list[str] | None) -> Any:
     return result
 
 
+def _trim_cluster_articles(result: Any, top_n: int | None) -> Any:
+    """Cap each cluster's `articles` list to its first `top_n` entries, in
+    whatever order the API returned them within that cluster (not independently
+    verified as relevance-ranked -- just preserved as-is rather than resorted),
+    without touching `cluster_size` -- News API v3 has no upstream knob to limit
+    articles per cluster on search_articles/get_latest_headlines (unlike
+    get_breaking_news's native top_n_articles), so page_size=50 clustered into
+    e.g. 25 clusters still returns all ~50 full article objects: clustering only
+    reorganizes the response, it doesn't shrink it. A heavily-syndicated story's
+    cluster can otherwise dump a dozen+ near-duplicate articles into the response
+    by itself. `cluster_size` is left untouched so the caller still sees the true
+    total even though only `top_n` articles are shown.
+
+    No-op when top_n is None (no cap requested) or the result has no
+    `clusters` list (clustering_enabled=False, or an error response).
+    """
+    if top_n is None or not isinstance(result, dict):
+        return result
+    clusters = result.get("clusters")
+    if isinstance(clusters, list):
+        for c in clusters:
+            if isinstance(c, dict) and isinstance(c.get("articles"), list):
+                c["articles"] = c["articles"][:top_n]
+    return result
+
+
 def build_source(fields: list[str] | None, clustered: bool) -> str | None:
     """Turn a caller's list of article field names into the News API `_source`
     value: a comma-separated string of dotted paths that trims the response
@@ -587,10 +646,11 @@ async def search_articles(
     word_count_min: int | None = None,
     word_count_max: int | None = None,
     page: int = 1,
-    page_size: int = 100,
+    page_size: int = 50,
     clustering_enabled: bool | None = True,
     clustering_variable: str | None = None,
     clustering_threshold: float | None = None,
+    cluster_top_n_articles: int | None = 3,
     include_nlp_data: bool | None = True,
     has_nlp: bool | None = None,
     theme: list[str] | None = None,
@@ -621,6 +681,20 @@ async def search_articles(
     - clustering_enabled, exclude_duplicates, and include_nlp_data all default to
       true for richer, deduplicated, NLP-enriched results -- pass false to opt out
       of any of them. clustering_enabled changes the response shape (see Returns).
+    - Defaults (clustering_enabled=True, page_size=50, cluster_top_n_articles=3) are
+      tuned for a broad/basic request -- grouped coverage of a topic without
+      flooding the response. When the user instead wants direct articles or cares
+      about specific sources (tracking one outlet, precise source-checking, "did X
+      cover this") rather than grouped coverage, pass clustering_enabled=False and
+      page_size=20: a plain, ungrouped article list, since cluster_top_n_articles's
+      per-cluster cap could otherwise hide the specific article/source they're
+      after if it isn't among the top 3 in its cluster.
+    - Clustering reorganizes results, it doesn't shrink them: page_size=50 grouped
+      into (say) 25 clusters still returns ~50 full article objects total -- a
+      heavily-syndicated story's cluster can otherwise dump a dozen+ near-duplicate
+      articles into the response by itself. cluster_top_n_articles caps each
+      cluster's `articles` list client-side (default 3) while leaving `cluster_size`
+      intact, so you still see the true total. Pass None for no cap.
     - `fields` defaults to a lean, generally-useful set -- title, link,
       published_date, domain_url, author, language, nlp.summary,
       nlp.translation_summary, nlp.theme -- instead of the full ~40-field object
@@ -718,9 +792,14 @@ async def search_articles(
         word_count_min: Minimum article word count.
         word_count_max: Maximum article word count.
         page: Page number, 1-indexed. Defaults to 1.
-        page_size: Results per page, max 1000. Defaults to 100. Clustering
-            operates one page at a time -- raise this to your expected result
-            count for coherent clusters.
+        page_size: Results per page, max 1000. Defaults to 50 -- sized for the
+            default clustered view (clustering_enabled=True, cluster_top_n_articles=3),
+            not a plain article list. Clustering operates one page at a time -- raise
+            this to your expected result count for coherent clusters. For a query where
+            the user wants direct articles/specific sources rather than grouped
+            coverage (e.g. tracking one outlet, or precise source-checking), pass
+            clustering_enabled=False and page_size=20 instead of relying on the
+            clustered defaults.
         clustering_enabled: Group results into near-duplicate/related clusters.
             Defaults to True -- the response then has `clusters`/`clusters_count`
             instead of a flat `articles` list (see Returns). Pass False for a
@@ -729,6 +808,14 @@ async def search_articles(
             (deprecated) for articles published on/after 2026-01-01.
         clustering_threshold: Similarity threshold in (0, 1], default 0.7. Higher
             = tighter/smaller clusters.
+        cluster_top_n_articles: Client-side cap on articles shown per cluster
+            (News API has no server-side equivalent for this endpoint, unlike
+            get_breaking_news's native top_n_articles). Defaults to 3 -- clustering
+            groups results but doesn't shrink them, so a large cluster can otherwise
+            fill the response with near-duplicate coverage of one story.
+            `cluster_size` is unaffected, so the true count is still visible. Pass
+            None for no cap (every article in every cluster). Ignored when
+            clustering_enabled=False (no clusters to trim).
         include_nlp_data: Populate each article's `nlp` block (theme, sentiment,
             NER, summary, embeddings). Defaults to True.
         has_nlp: Filter to only articles that have NLP data (indexed July 2023+).
@@ -760,9 +847,10 @@ async def search_articles(
     Returns:
         JSON with `status`, `total_hits`, `page`, `total_pages`, `page_size`, and
         (by default, since clustering_enabled defaults to True) `clusters_count` +
-        `clusters` (each `{cluster_id, cluster_size, articles}`) -- pass
-        clustering_enabled=False for a flat `articles` list instead. Also includes
-        `user_input` echoing back the parameters actually applied.
+        `clusters` (each `{cluster_id, cluster_size, articles}`, `articles` capped
+        to `cluster_top_n_articles` per cluster) -- pass clustering_enabled=False
+        for a flat `articles` list instead. Also includes `user_input` echoing back
+        the parameters actually applied.
 
     Common API errors:
         - 401: missing or invalid API token.
@@ -782,6 +870,7 @@ async def search_articles(
         validate_rank(from_rank, "from_rank")
         validate_rank(to_rank, "to_rank")
         validate_clustering_threshold(clustering_threshold)
+        validate_cluster_top_n_articles(cluster_top_n_articles)
         validate_sentiment_range(title_sentiment_min, "title_sentiment_min")
         validate_sentiment_range(title_sentiment_max, "title_sentiment_max")
         validate_sentiment_range(content_sentiment_min, "content_sentiment_min")
@@ -853,7 +942,9 @@ async def search_articles(
             result = await _search_clustered_across_cutoff(api_token, body)
         else:
             result = await make_api_request(api_token=api_token, path="/api/search", json_data=body)
-        return json.dumps(result, indent=2)
+        if clustered:
+            result = _trim_cluster_articles(result, cluster_top_n_articles)
+        return json.dumps(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -885,10 +976,11 @@ async def get_latest_headlines(
     word_count_min: int | None = None,
     word_count_max: int | None = None,
     page: int = 1,
-    page_size: int = 100,
+    page_size: int = 50,
     clustering_enabled: bool | None = True,
     clustering_variable: str | None = None,
     clustering_threshold: float | None = None,
+    cluster_top_n_articles: int | None = 3,
     include_translation_fields: bool | None = True,
     include_nlp_data: bool | None = True,
     has_nlp: bool | None = None,
@@ -950,9 +1042,14 @@ async def get_latest_headlines(
         word_count_min: Minimum article word count.
         word_count_max: Maximum article word count.
         page: Page number, 1-indexed. Defaults to 1.
-        page_size: Results per page, max 1000. Defaults to 100. Clustering
-            operates one page at a time -- raise this to your expected result
-            count for coherent clusters.
+        page_size: Results per page, max 1000. Defaults to 50 -- sized for the
+            default clustered view (clustering_enabled=True, cluster_top_n_articles=3),
+            not a plain article list. Clustering operates one page at a time -- raise
+            this to your expected result count for coherent clusters. For a query where
+            the user wants direct articles/specific sources rather than grouped
+            coverage (e.g. tracking one outlet, or precise source-checking), pass
+            clustering_enabled=False and page_size=20 instead of relying on the
+            clustered defaults.
         clustering_enabled: Group results into near-duplicate/related clusters.
             Defaults to True -- the response then has `clusters`/`clusters_count`
             instead of a flat `articles` list (see Returns). Pass False for a
@@ -960,6 +1057,9 @@ async def get_latest_headlines(
         clustering_variable: "content" (default), "title", or "summary" -- ignored
             (deprecated) for articles published on/after 2026-01-01.
         clustering_threshold: Similarity threshold in (0, 1], default 0.7.
+        cluster_top_n_articles: Client-side cap on articles shown per cluster
+            (see search_articles's Args for the full rationale). Defaults to 3.
+            Pass None for no cap. Ignored when clustering_enabled=False.
         include_translation_fields: Add title_translated_en/content_translated_en and
             nlp.translation_summary/translation_ner_* to results (needs include_nlp_data
             too for the nlp.* fields). Defaults to True -- this is also what populates
@@ -985,8 +1085,9 @@ async def get_latest_headlines(
     Returns:
         JSON with `status`, `total_hits`, `page`, `total_pages`, `page_size`, and
         (by default, since clustering_enabled defaults to True) `clusters_count` +
-        `clusters` instead of a flat `articles` list -- pass clustering_enabled=False
-        for a plain article list.
+        `clusters` (each `articles` list capped to `cluster_top_n_articles`)
+        instead of a flat `articles` list -- pass clustering_enabled=False for a
+        plain article list.
 
     Common API errors:
         - 401: missing or invalid API token.
@@ -999,6 +1100,7 @@ async def get_latest_headlines(
         validate_fields(fields)
         validate_page_params(page, page_size)
         validate_clustering_threshold(clustering_threshold)
+        validate_cluster_top_n_articles(cluster_top_n_articles)
         validate_sentiment_range(title_sentiment_min, "title_sentiment_min")
         validate_sentiment_range(title_sentiment_max, "title_sentiment_max")
         validate_sentiment_range(content_sentiment_min, "content_sentiment_min")
@@ -1049,11 +1151,14 @@ async def get_latest_headlines(
         body.update(flatten_custom_tags(custom_tags))
         _add_field(body, "robots_compliant", robots_compliant)
 
-        source = build_source(fields, body.get("clustering_enabled") is True)
+        clustered = body.get("clustering_enabled") is True
+        source = build_source(fields, clustered)
         if source is not None:
             body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/latest_headlines", json_data=body)
-        return json.dumps(result, indent=2)
+        if clustered:
+            result = _trim_cluster_articles(result, cluster_top_n_articles)
+        return json.dumps(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -1178,7 +1283,7 @@ async def get_breaking_news(
         _add_field(body, "content_sentiment_max", content_sentiment_max)
 
         result = await make_api_request(api_token=api_token, path="/api/breaking_news", json_data=body)
-        return json.dumps(_project_result(result, fields), indent=2)
+        return json.dumps(_project_result(result, fields))
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -1361,7 +1466,7 @@ async def search_by_author(
         if source is not None:
             body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/authors", json_data=body)
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -1428,7 +1533,7 @@ async def search_by_link(
         if source is not None:
             body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/search_by_link", json_data=body)
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -1537,7 +1642,7 @@ async def list_sources(
         _add_field(body, "to_rank", to_rank)
 
         result = await make_api_request(api_token=api_token, path="/api/sources", json_data=body)
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -1742,7 +1847,7 @@ async def get_aggregation_count(
         _add_field(body, "robots_compliant", robots_compliant)
 
         result = await make_api_request(api_token=api_token, path="/api/aggregation_count", json_data=body)
-        return json.dumps(result, indent=2)
+        return json.dumps(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:

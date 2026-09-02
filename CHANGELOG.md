@@ -6,6 +6,106 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.4] — 2026-09-02
+
+### Changed
+- `search_articles`/`get_latest_headlines`'s `page_size` default dropped from
+  `100` to `50`. These are the only two tools where the default is now sized
+  for the default *clustered* view (`clustering_enabled=true`,
+  `cluster_top_n_articles=3`, both already the default) rather than a flat
+  article dump -- a basic/broad request now pulls a smaller, grouped set by
+  default. `get_breaking_news`, `search_by_author`, `search_by_link`, and
+  `get_aggregation_count` are unaffected (still default `100`).
+
+### Docs
+- Documented a second calling pattern for `search_articles`/`get_latest_headlines`
+  alongside the clustered default: when the user wants direct articles or cares
+  about specific sources rather than grouped topic coverage (tracking one
+  outlet, precise source-checking, "did X cover this"), pass
+  `clustering_enabled=false` and `page_size=20` for a plain, ungrouped list.
+  Flagged explicitly why this matters: with clustering on, the specific
+  article/source the user is after could be hidden by the
+  `cluster_top_n_articles=3` cap if it isn't among the top 3 in its cluster.
+  Added to the shared server instructions, both tools' docstrings, and README.
+
+### Tests
+- Updated `ToolBehaviorTests.test_tool_request_mapping`'s expected request
+  bodies for the `search_articles`/`get_latest_headlines` cases that omit
+  `page_size` (6 of them) from `100` to `50` to match the new default.
+
+---
+
+## [0.4.3] — 2026-09-02
+
+### Added
+- `cluster_top_n_articles` on `search_articles`/`get_latest_headlines` (default
+  `3`, pass `None` for no cap): caps how many articles are shown per cluster.
+  Clustering reorganizes results, it doesn't shrink them -- News API groups
+  every matched article into a cluster and drops none, so `page_size=100`
+  grouped into 50 clusters is still ~100 full article objects on the wire. A
+  heavily-syndicated story's cluster (dozens of near-identical writeups of one
+  event) could previously dump all of them into the response by itself.
+  `cluster_size` is left untouched by the trim, so the true per-cluster total
+  is always visible even when only `top_n` articles are shown. This mirrors
+  `get_breaking_news`'s existing `top_n_articles`, except News API v3 has no
+  server-side equivalent for these two endpoints, so it's applied client-side
+  (`server._trim_cluster_articles`) after the full clustered response comes
+  back -- it does not reduce the upstream API call itself, only what's
+  returned to the caller. Measured on representative payloads: ~18% smaller
+  when clustering only mildly consolidates results, up to ~34% when one viral
+  story dominates the page with a large cluster.
+
+### Tests
+- New validator tests for `validate_cluster_top_n_articles` (valid ints, `None`
+  for no cap, rejects `<= 0`).
+- New behavioral tests: the cap trims `clusters[].articles` while leaving
+  `cluster_size` intact, `None` disables the cap, it's a no-op when
+  `clustering_enabled=False` (nothing to trim), it's never sent in the
+  upstream request body (client-side only), and it applies identically on
+  `get_latest_headlines`.
+
+---
+
+## [0.4.2] — 2026-09-02
+
+### Changed
+- Dropped `indent=2` from `json.dumps` on the 7 tools whose output is
+  consumed only by a model (`search_articles`, `get_latest_headlines`,
+  `get_breaking_news`, `search_by_author`, `search_by_link`, `list_sources`,
+  `get_aggregation_count`) — pretty-printing exists for a human reading raw
+  output, and the newlines/indentation it adds are pure token overhead for an
+  LLM consumer (~17% smaller payload for the same JSON content, no data
+  change). `get_subscription` and `check_health` keep `indent=2` since those
+  two are the ones a person is actually likely to read directly (quota
+  checks, liveness pings).
+
+### Tests
+- `ToolBehaviorTests._assert_tool_call`'s shared assertion now expects
+  `indent=2` only for `get_subscription`/`check_health` and no indent for
+  every other tool, matching the change above.
+
+---
+
+## [0.4.1] — 2026-09-02
+
+### Docs
+- Corrected the documented API token precedence (module docstring, `FastMCP`
+  `instructions` text, `get_api_token`'s docstring, README): `?apiToken=` URL
+  query parameter actually outranks the `x-api-token`/`Authorization: Bearer`
+  headers, not the reverse as previously stated everywhere except
+  `_token_from_session`'s own docstring. Found via a team report of
+  `?apiToken=BOGUS` alongside a valid `x-api-token` header returning `401`
+  instead of using the header. Root cause: `ApiTokenASGIMiddleware`
+  unconditionally captures `?apiToken=` into the `session_api_token`
+  ContextVar on any request that carries it (and remembers it for the rest of
+  that session once seen on `initialize`), and `_token_from_session()` reads
+  that ContextVar before ever inspecting headers. Behavior unchanged — this is
+  a documentation-only fix. Only affects direct server access; a FastMCP
+  Gateway deployment never forwards `?apiToken=`, so the header is effectively
+  top priority there regardless.
+
+---
+
 ##  [0.4.0] — 2026-09-01
 
 ### Fixed
