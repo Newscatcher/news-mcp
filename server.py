@@ -30,6 +30,7 @@ from validators import (
     CLUSTERING_CUTOFF_DATE,
     CLUSTERING_CUTOFF_PREV_DATE,
     CLUSTERING_VARIABLE_VALUES,
+    DEFAULT_ARTICLE_FIELDS,
     NEWS_DOMAIN_TYPE_VALUES,
     SORT_BY_VALUES,
     clustering_straddles_cutoff,
@@ -38,6 +39,7 @@ from validators import (
     validate_choice,
     validate_clustering_threshold,
     validate_country,
+    validate_fields,
     validate_ids_or_links,
     validate_lang,
     validate_page_params,
@@ -144,11 +146,20 @@ If no token is found, tools return `Error: API token is required.`
 - `check_health` — local liveness ping only (does not call the News API). Use as a zero-setup first call.
 - There is no "find articles similar to this one" tool. Reach similarity via `clustering_enabled`+`clustering_threshold` (on `search_articles`/`get_latest_headlines`), `exclude_duplicates` (search only), or by requesting `include_nlp_data=true` and comparing the returned embeddings yourself.
 
-## Defaults for simple queries — clustering, deduplication, and NLP
+## Defaults for simple queries — clustering, deduplication, NLP, and output fields
 `search_articles`, `get_latest_headlines`, `get_breaking_news`, and `search_by_author` default
-`include_nlp_data` to `true` (adds theme/sentiment/NER/summary to each article). `search_articles`
-additionally defaults `clustering_enabled` and `exclude_duplicates` to `true`. Pass `false` explicitly
-on any of these to opt out.
+`include_nlp_data` and `include_translation_fields` to `true` (adds theme/sentiment/NER/summary and
+translation fields to each article). `search_articles` additionally defaults `clustering_enabled` and
+`exclude_duplicates` to `true`. Pass `false` explicitly on any of these to opt out.
+- All five tools that accept `fields` (`search_articles`, `get_latest_headlines`, `get_breaking_news`,
+  `search_by_author`, `search_by_link`) default it to a lean set instead of the full ~40-field object:
+  `title`, `link`, `published_date`, `domain_url`, `author`, `language`, `nlp.summary`,
+  `nlp.translation_summary`, `nlp.theme`. Pass `fields=[]` explicitly to get full, untrimmed objects —
+  do this when the user asks what else is available or wants to see everything. The default carries
+  both `nlp.summary` and `nlp.translation_summary` so non-English articles still get a usable summary
+  (only one of the two is normally populated on a given article — use whichever one is). Note:
+  `search_by_link` has no `include_translation_fields` toggle, so `nlp.translation_summary` is always
+  empty there; only `nlp.summary` populates.
 - Enabling `clustering_enabled` changes the response shape: you get `clusters_count` + `clusters`
   (each `{cluster_id, cluster_size, articles}`) instead of a flat `articles` list. Pass
   `clustering_enabled=false` if you just want a plain article list.
@@ -156,6 +167,12 @@ on any of these to opt out.
   differently, rather than being strictly complementary: clustering groups related articles (all
   articles kept, reorganized into groups), `exclude_duplicates` removes near-identical ones (fewer
   articles, stays flat, adds `duplicate_count`/`duplicate_articles_group_id` per result).
+- Keep `exclude_duplicates=true` (the default) for most queries -- it's the right default because
+  most callers want distinct stories, not every syndication of the same wire copy. Override to
+  `false` only when: (a) the user explicitly asks to include duplicates/reprints, or (b) the goal is
+  an exhaustive mention count for a specific company/person (e.g. "how many times was X mentioned",
+  "every article about Y") -- deduplication can suppress separate, individually-relevant mentions as
+  "near-identical," which undercounts exactly the thing being measured.
 - `clustering_threshold` (default 0.7, range (0, 1]) controls cluster tightness. Clustering operates
   one page at a time, so raise `page_size` to at least your expected result count for coherent clusters.
 - `clustering_variable` is deprecated (ignored) for articles published on/after 2026-01-01 — since
@@ -217,8 +234,11 @@ common source of broken queries, so read this before constructing a non-trivial 
   broaden with OR, increase NEAR distance, or use a wildcard.
 
 ## Entity search and multilingual coverage
-`org_entity_name`/`per_entity_name`/`loc_entity_name`/`misc_entity_name` (and `ner_name` on
-search_by_author) support the same AND/OR/NOT/NEAR syntax as `q`, plus one more operator:
+When looking for a specific company, person, or location, use the NER entity filters
+(`org_entity_name`/`per_entity_name`/`loc_entity_name`/`misc_entity_name`, or `ner_name` on
+search_by_author) — they match articles where NewsCatcher's NLP recognized the entity as such, which
+catches phrasing a plain `q` keyword search misses (and vice versa: `q` catches mentions the NER model
+missed). These filters support the same AND/OR/NOT/NEAR syntax as `q`, plus one more operator:
 `COUNT("Entity Name", n, "gt")` filters to articles mentioning that entity more than n times — a proxy
 for how central the entity is, not just a passing mention. Combine with `include_nlp_data=true` (the
 default) to see actual mention counts in `nlp.ner_*`.
@@ -226,14 +246,34 @@ default) to see actual mention counts in `nlp.ner_*`.
 News API translates non-English articles to English at index time (translation fields available for
 articles published from 2025-03-12 onward), so entity names and keywords work across languages using
 their English form even when the underlying article is in another language:
-- Set `search_in=["title_content", "title_content_translated"]` to search both original and translated
-  text in one call.
+- `search_in` defaults to `title_content` (title+content) — leave it unset for most queries. Narrow to
+  `["title"]` for high-precision matching on one specific company/event/person. For multilingual
+  coverage with the same English-language query, use `["title_translated"]`/`["title_content_translated"]`
+  instead of the default, or add one alongside it — e.g. `search_in=["title_content",
+  "title_content_translated"]` — to search original and translated text in one call.
 - Omit `lang` to search across all languages; use `countries` to focus on specific regions instead.
 - Use official English names in quotes, e.g. `org_entity_name='"European Union" OR "European Commission"'`
   also matches "Union européenne"/"Unión Europea" in French/Spanish articles.
 - Set `include_translation_fields=true` to get `title_translated_en`/`content_translated_en` and
   `nlp.translation_summary`/`nlp.translation_ner_*` back on each result — the `translation_ner_*` fields
-  need `include_nlp_data=true` too (on by default) to appear.""",
+  need `include_nlp_data=true` too (on by default) to appear.
+
+## Consider running multiple searches, not just one
+A single call is often enough — don't default to running several when one plain query already answers
+the question. But for a query where coverage genuinely matters (tracking a company/person, gauging how
+something is being reported, anything where missing relevant articles would be a real problem), running
+more than one search with different angles and comparing/merging the results can surface things a single
+call would miss. There's no fixed recipe — judge which of these are actually worth it for the query at
+hand:
+- NER entity filter vs. plain `q` keyword search — each catches articles the other misses (see above).
+- Default `search_in` vs. `title_translated`/`title_content_translated` — original-language coverage vs.
+  translated multilingual coverage.
+- `predefined_sources=["top N <country>"]` vs. no source restriction (or `ranked_only=false`) — major-
+  outlet coverage vs. smaller/niche sources that might carry a story the majors haven't picked up.
+- `is_headline=true` vs. unfiltered — front-page/top-billed treatment vs. the full set of mentions.
+- Splitting a broad topic across a few `theme` values instead of one unthemed query, when the topic
+  plausibly spans multiple themes (e.g. Business and Politics).
+Decide per query, not as a fixed checklist — most requests still just need one well-formed call.""",
 )
 
 
@@ -374,28 +414,74 @@ def _add_list_field(body: dict[str, Any], key: str, value: list[str] | None) -> 
     FastMCP validates incoming tool-call arguments against each parameter's
     JSON schema before this function ever runs, so `value` is guaranteed to
     already be a real list or None -- no comma-string coercion is needed here.
+
+    Most multi-value filters accept a native JSON array over POST. A handful
+    (search_in, theme, not_theme, predefined_sources) do not -- News API v3
+    rejects a JSON array for those with a `499 str type expected` (or, for
+    predefined_sources, `422`) error and requires a comma-joined string
+    instead. Use `_add_comma_list_field` for those.
     """
     if value:
         body[key] = value
 
 
+def _add_comma_list_field(body: dict[str, Any], key: str, value: list[str] | None) -> None:
+    """Set body[key] = a comma-joined string if a non-empty list was provided.
+
+    News API v3 rejects a JSON array for search_in/theme/not_theme/
+    predefined_sources over POST (`499 str type expected`, or `422` for
+    predefined_sources) even though it accepts arrays for every other
+    multi-value filter -- confirmed against the live API. The tool parameter
+    stays `list[str]` for a consistent, discoverable schema; this is where
+    that list gets converted to the string form the API actually requires.
+    """
+    if value:
+        body[key] = ",".join(value)
+
+
 def _project_result(result: Any, fields: list[str] | None) -> Any:
     """Opt-in output projection. When `fields` is provided, trim every returned
-    article -- both a top-level `articles` list and articles nested under
-    `clusters` -- to just those top-level keys. No-op when `fields` is None.
+    article -- a top-level `articles` list, articles nested under `clusters`, and
+    articles nested under `breaking_news_events` (get_breaking_news's own shape)
+    -- to just those keys. No-op when `fields` is falsy (None or []).
 
     News API v3 returns ~40 fields per article (plus large `all_links` /
     `all_domain_links` / `nlp` structures), which can blow an agent's context on a
     single call. This lets a caller ask for only what it needs (e.g.
-    fields=["title","link","published_date","domain_url","summary"]) without
-    changing behaviour for callers that don't pass it.
+    fields=["title","link","published_date","domain_url","description"]) without
+    changing behaviour for callers that pass fields=[] to opt out.
+
+    Supports one level of dotting (e.g. "nlp.summary", "nlp.theme") the same way
+    build_source's server-side `_source` trim does -- get_breaking_news is the one
+    tool that uses this function instead of `_source` (its response shape has no
+    server-side equivalent), and DEFAULT_ARTICLE_FIELDS relies on dotted nlp.*
+    paths, so this has to understand them too or the whole `nlp` block would
+    silently disappear from get_breaking_news's default output.
+
+    There is no top-level "summary" field on an article -- a common mistake.
+    Use "description" for the short lede, or "nlp.summary" for the AI-generated
+    summary (requires `include_nlp_data=True`, the default). `validate_fields`
+    rejects an unrecognized name before this function ever runs, so there is no
+    silent-drop case left for a genuinely bad field name.
     """
     if not fields or not isinstance(result, dict):
         return result
-    keep = set(fields)
+    top_keys = {f for f in fields if "." not in f}
+    nested: dict[str, set[str]] = {}
+    for f in fields:
+        if "." in f:
+            parent, _, child = f.partition(".")
+            nested.setdefault(parent, set()).add(child)
 
     def proj(a: Any) -> Any:
-        return {k: v for k, v in a.items() if k in keep} if isinstance(a, dict) else a
+        if not isinstance(a, dict):
+            return a
+        out = {k: v for k, v in a.items() if k in top_keys}
+        for parent, children in nested.items():
+            sub = a.get(parent)
+            if isinstance(sub, dict):
+                out[parent] = {k: v for k, v in sub.items() if k in children}
+        return out
 
     if isinstance(result.get("articles"), list):
         result["articles"] = [proj(a) for a in result["articles"]]
@@ -403,6 +489,10 @@ def _project_result(result: Any, fields: list[str] | None) -> Any:
         for c in result["clusters"]:
             if isinstance(c, dict) and isinstance(c.get("articles"), list):
                 c["articles"] = [proj(a) for a in c["articles"]]
+    if isinstance(result.get("breaking_news_events"), list):
+        for e in result["breaking_news_events"]:
+            if isinstance(e, dict) and isinstance(e.get("articles"), list):
+                e["articles"] = [proj(a) for a in e["articles"]]
     return result
 
 
@@ -465,7 +555,7 @@ async def search_articles(
     q: str,
     api_token: str = "",
     search_in: list[str] | None = None,
-    include_translation_fields: bool | None = None,
+    include_translation_fields: bool | None = True,
     predefined_sources: list[str] | None = None,
     source_name: str | None = None,
     sources: list[str] | None = None,
@@ -516,7 +606,7 @@ async def search_articles(
     custom_tags: dict[str, list[str]] | None = None,
     exclude_duplicates: bool | None = True,
     robots_compliant: bool | None = None,
-    fields: list[str] | None = None,
+    fields: list[str] | None = DEFAULT_ARTICLE_FIELDS,
 ) -> str:
     """
     Full-text/boolean keyword search over global news articles. The richest tool
@@ -531,11 +621,20 @@ async def search_articles(
     - clustering_enabled, exclude_duplicates, and include_nlp_data all default to
       true for richer, deduplicated, NLP-enriched results -- pass false to opt out
       of any of them. clustering_enabled changes the response shape (see Returns).
-    - fields: pass a list of article keys (e.g. ["title","link","published_date",
-      "domain_url","summary","nlp"]) to trim each returned article to just those --
-      News API v3 returns ~40 fields per article (the biggest being the large
-      all_links/all_domain_links/all_links_text arrays), so this keeps large,
-      enriched result sets within an agent's context budget. Omit for full objects.
+    - `fields` defaults to a lean, generally-useful set -- title, link,
+      published_date, domain_url, author, language, nlp.summary,
+      nlp.translation_summary, nlp.theme -- instead of the full ~40-field object
+      (the biggest being the all_links/all_domain_links/all_links_text arrays and
+      the full `content` body), keeping ordinary result sets within an agent's
+      context budget without extra effort. Pass `fields=[]` explicitly to opt out
+      and get full objects (e.g. the user asks what else is available, or wants
+      to see everything). The default includes both `nlp.summary` and
+      `nlp.translation_summary` (needs include_translation_fields=True, also the
+      default) so non-English articles still get a usable summary -- when
+      presenting results, use whichever of the two is actually populated. There
+      is no top-level "summary" field; passing a custom `fields` list with an
+      unrecognized name returns an immediate corrective error instead of
+      silently vanishing from the response.
     - Hard cap: 10,000 matched articles per query regardless of pagination. Call
       get_aggregation_count first on broad/undated queries to measure actual volume
       and time-chunk the date range accordingly (denser topics need hourly chunks,
@@ -557,15 +656,27 @@ async def search_articles(
             [ ] / \\ : ^. "*" alone matches all articles (useful for filter-only
             queries). api_token: News API token.
             Optional if provided via x-api-token header or NEWS_API_KEY env var.
-        search_in: Which fields to search q in. Max 2 of: title, content, summary,
-            title_content (default), title_translated, content_translated,
-            summary_translated, title_content_translated. For multilingual coverage,
-            pass ["title_content", "title_content_translated"] to search original and
-            translated text together (see this server's instructions).
+        search_in: Which fields to search q in. Leave unset for most queries -- the
+            default (title_content) already covers title+content, the right breadth
+            for standard recall. Narrow to ["title"] for high-precision matching on
+            one specific company/event/person (fewer, more substantively-relevant
+            hits, not passing mentions). For multilingual coverage with an
+            English-language query, use ["title_translated"] or
+            ["title_content_translated"] alone, or add one to the default (e.g.
+            ["title_content", "title_content_translated"]) to search original and
+            translated text together in one call. Max 2 values. Full value list:
+            title, content, summary, title_content (default), title_translated,
+            content_translated, summary_translated, title_content_translated (see
+            this server's instructions).
         include_translation_fields: Add title_translated_en/content_translated_en and
             nlp.translation_summary/translation_ner_* to results (needs include_nlp_data
-            too for the nlp.* fields). See this server's instructions for multilingual tips.
+            too for the nlp.* fields). Defaults to True -- this is also what populates
+            nlp.translation_summary in the default `fields` set for non-English
+            articles. See this server's instructions for multilingual tips.
         predefined_sources: Top-N sources per country, e.g. ["top 50 US", "top 20 GB"].
+            Use when the user wants "top"/"major"/"reputable" sources for a country
+            rather than a specific list -- prefer this over enumerating domains by
+            hand via `sources`.
         source_name: Fuzzy match on publisher display name (comma-separated string).
         sources: Include only these domains/subdomains.
         not_sources: Exclude these domains/subdomains.
@@ -663,6 +774,7 @@ async def search_articles(
     try:
         lint_query(q)
         validate_search_in(search_in)
+        validate_fields(fields)
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
         validate_choice(news_domain_type, NEWS_DOMAIN_TYPE_VALUES, "news_domain_type")
         validate_choice(clustering_variable, CLUSTERING_VARIABLE_VALUES, "clustering_variable")
@@ -682,9 +794,9 @@ async def search_articles(
         # the boundary (not rejected), so we intentionally do NOT pre-raise here.
 
         body: dict[str, Any] = {"q": q, "page": page, "page_size": page_size}
-        _add_list_field(body, "search_in", search_in)
+        _add_comma_list_field(body, "search_in", search_in)
         _add_field(body, "include_translation_fields", include_translation_fields)
-        _add_list_field(body, "predefined_sources", predefined_sources)
+        _add_comma_list_field(body, "predefined_sources", predefined_sources)
         _add_field(body, "source_name", source_name)
         _add_list_field(body, "sources", sources)
         _add_list_field(body, "not_sources", not_sources)
@@ -719,8 +831,8 @@ async def search_articles(
         _add_field(body, "clustering_threshold", clustering_threshold)
         _add_field(body, "include_nlp_data", include_nlp_data)
         _add_field(body, "has_nlp", has_nlp)
-        _add_list_field(body, "theme", theme)
-        _add_list_field(body, "not_theme", not_theme)
+        _add_comma_list_field(body, "theme", theme)
+        _add_comma_list_field(body, "not_theme", not_theme)
         _add_field(body, "ORG_entity_name", org_entity_name)
         _add_field(body, "PER_entity_name", per_entity_name)
         _add_field(body, "LOC_entity_name", loc_entity_name)
@@ -777,7 +889,7 @@ async def get_latest_headlines(
     clustering_enabled: bool | None = True,
     clustering_variable: str | None = None,
     clustering_threshold: float | None = None,
-    include_translation_fields: bool | None = None,
+    include_translation_fields: bool | None = True,
     include_nlp_data: bool | None = True,
     has_nlp: bool | None = None,
     theme: list[str] | None = None,
@@ -792,7 +904,7 @@ async def get_latest_headlines(
     content_sentiment_max: float | None = None,
     custom_tags: dict[str, list[str]] | None = None,
     robots_compliant: bool | None = None,
-    fields: list[str] | None = None,
+    fields: list[str] | None = DEFAULT_ARTICLE_FIELDS,
 ) -> str:
     """
     Recent headlines over a rolling time window -- no keyword query required.
@@ -819,7 +931,10 @@ async def get_latest_headlines(
         not_lang: Exclude these ISO 639-1 language codes.
         countries: Include only these ISO 3166-1 alpha-2 publisher countries.
         not_countries: Exclude these ISO 3166-1 alpha-2 publisher countries.
-        predefined_sources: Top-N sources per country, e.g. ["top 50 US"].
+        predefined_sources: Top-N sources per country, e.g. ["top 50 US"]. Use when
+            the user wants "top"/"major"/"reputable" sources for a country rather
+            than a specific list -- prefer this over enumerating domains by hand
+            via `sources`.
         sources: Include only these domains/subdomains.
         not_sources: Exclude these domains/subdomains.
         not_author_name: Exclude these author names (comma-separated string).
@@ -847,7 +962,9 @@ async def get_latest_headlines(
         clustering_threshold: Similarity threshold in (0, 1], default 0.7.
         include_translation_fields: Add title_translated_en/content_translated_en and
             nlp.translation_summary/translation_ner_* to results (needs include_nlp_data
-            too for the nlp.* fields). See this server's instructions for multilingual tips.
+            too for the nlp.* fields). Defaults to True -- this is also what populates
+            nlp.translation_summary in the default `fields` set for non-English
+            articles. See this server's instructions for multilingual tips.
         include_nlp_data: Populate each article's `nlp` block. Defaults to True.
         has_nlp: Filter to only articles that have NLP data (indexed July 2023+).
         theme: Filter to these themes -- open vocabulary, not a hard enum.
@@ -879,6 +996,7 @@ async def get_latest_headlines(
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
         validate_choice(clustering_variable, CLUSTERING_VARIABLE_VALUES, "clustering_variable")
+        validate_fields(fields)
         validate_page_params(page, page_size)
         validate_clustering_threshold(clustering_threshold)
         validate_sentiment_range(title_sentiment_min, "title_sentiment_min")
@@ -898,7 +1016,7 @@ async def get_latest_headlines(
         _add_list_field(body, "not_lang", not_lang)
         _add_list_field(body, "countries", countries)
         _add_list_field(body, "not_countries", not_countries)
-        _add_list_field(body, "predefined_sources", predefined_sources)
+        _add_comma_list_field(body, "predefined_sources", predefined_sources)
         _add_list_field(body, "sources", sources)
         _add_list_field(body, "not_sources", not_sources)
         _add_field(body, "not_author_name", not_author_name)
@@ -918,8 +1036,8 @@ async def get_latest_headlines(
         _add_field(body, "include_translation_fields", include_translation_fields)
         _add_field(body, "include_nlp_data", include_nlp_data)
         _add_field(body, "has_nlp", has_nlp)
-        _add_list_field(body, "theme", theme)
-        _add_list_field(body, "not_theme", not_theme)
+        _add_comma_list_field(body, "theme", theme)
+        _add_comma_list_field(body, "not_theme", not_theme)
         _add_field(body, "ORG_entity_name", org_entity_name)
         _add_field(body, "PER_entity_name", per_entity_name)
         _add_field(body, "LOC_entity_name", loc_entity_name)
@@ -952,7 +1070,7 @@ async def get_breaking_news(
     page: int = 1,
     page_size: int = 100,
     top_n_articles: int | None = None,
-    include_translation_fields: bool | None = None,
+    include_translation_fields: bool | None = True,
     include_nlp_data: bool | None = True,
     has_nlp: bool | None = None,
     theme: list[str] | None = None,
@@ -965,7 +1083,7 @@ async def get_breaking_news(
     title_sentiment_max: float | None = None,
     content_sentiment_min: float | None = None,
     content_sentiment_max: float | None = None,
-    fields: list[str] | None = None,
+    fields: list[str] | None = DEFAULT_ARTICLE_FIELDS,
 ) -> str:
     """
     Actively-trending news event clusters, ordered by how heavily each is covered.
@@ -999,7 +1117,9 @@ async def get_breaking_news(
             top_n_articles * page_size must not exceed 1000.
         include_translation_fields: Add title_translated_en/content_translated_en and
             nlp.translation_summary/translation_ner_* to results (needs include_nlp_data
-            too for the nlp.* fields). See this server's instructions for multilingual tips.
+            too for the nlp.* fields). Defaults to True -- this is also what populates
+            nlp.translation_summary in the default `fields` set for non-English
+            articles. See this server's instructions for multilingual tips.
         include_nlp_data: Populate each article's `nlp` block. Defaults to True.
         has_nlp: Filter to only articles that have NLP data (indexed July 2023+).
         theme: Filter to these themes -- open vocabulary, not a hard enum.
@@ -1027,6 +1147,7 @@ async def get_breaking_news(
     """
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
+        validate_fields(fields)
         validate_page_params(page, page_size)
         validate_rank(from_rank, "from_rank")
         validate_rank(to_rank, "to_rank")
@@ -1045,8 +1166,8 @@ async def get_breaking_news(
         _add_field(body, "include_translation_fields", include_translation_fields)
         _add_field(body, "include_nlp_data", include_nlp_data)
         _add_field(body, "has_nlp", has_nlp)
-        _add_list_field(body, "theme", theme)
-        _add_list_field(body, "not_theme", not_theme)
+        _add_comma_list_field(body, "theme", theme)
+        _add_comma_list_field(body, "not_theme", not_theme)
         _add_field(body, "ORG_entity_name", org_entity_name)
         _add_field(body, "PER_entity_name", per_entity_name)
         _add_field(body, "LOC_entity_name", loc_entity_name)
@@ -1095,7 +1216,7 @@ async def search_by_author(
     word_count_max: int | None = None,
     page: int = 1,
     page_size: int = 100,
-    include_translation_fields: bool | None = None,
+    include_translation_fields: bool | None = True,
     include_nlp_data: bool | None = True,
     has_nlp: bool | None = None,
     theme: list[str] | None = None,
@@ -1107,7 +1228,7 @@ async def search_by_author(
     content_sentiment_max: float | None = None,
     custom_tags: dict[str, list[str]] | None = None,
     robots_compliant: bool | None = None,
-    fields: list[str] | None = None,
+    fields: list[str] | None = DEFAULT_ARTICLE_FIELDS,
 ) -> str:
     """
     All articles written by one specific byline (exact match).
@@ -1125,7 +1246,10 @@ async def search_by_author(
         api_token: News API token. Optional if provided via x-api-token header or
             NEWS_API_KEY env var.
         not_author_name: Exclude these other author names (comma-separated string).
-        predefined_sources: Top-N sources per country, e.g. ["top 50 US"].
+        predefined_sources: Top-N sources per country, e.g. ["top 50 US"]. Use when
+            the user wants "top"/"major"/"reputable" sources for a country rather
+            than a specific list -- prefer this over enumerating domains by hand
+            via `sources`.
         sources: Include only these domains/subdomains.
         not_sources: Exclude these domains/subdomains.
         lang: Include only these ISO 639-1 language codes.
@@ -1153,7 +1277,9 @@ async def search_by_author(
         page_size: Results per page, max 1000. Defaults to 100.
         include_translation_fields: Add title_translated_en/content_translated_en and
             nlp.translation_summary/translation_ner_* to results (needs include_nlp_data
-            too for the nlp.* fields). See this server's instructions for multilingual tips.
+            too for the nlp.* fields). Defaults to True -- this is also what populates
+            nlp.translation_summary in the default `fields` set for non-English
+            articles. See this server's instructions for multilingual tips.
         include_nlp_data: Populate each article's `nlp` block. Defaults to True.
         has_nlp: Filter to only articles that have NLP data (indexed July 2023+).
         theme: Filter to these themes -- open vocabulary, not a hard enum.
@@ -1179,6 +1305,7 @@ async def search_by_author(
     """
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
+        validate_fields(fields)
         validate_page_params(page, page_size)
         validate_rank(from_rank, "from_rank")
         validate_rank(to_rank, "to_rank")
@@ -1193,7 +1320,7 @@ async def search_by_author(
 
         body: dict[str, Any] = {"author_name": author_name, "page": page, "page_size": page_size}
         _add_field(body, "not_author_name", not_author_name)
-        _add_list_field(body, "predefined_sources", predefined_sources)
+        _add_comma_list_field(body, "predefined_sources", predefined_sources)
         _add_list_field(body, "sources", sources)
         _add_list_field(body, "not_sources", not_sources)
         _add_list_field(body, "lang", lang)
@@ -1220,8 +1347,8 @@ async def search_by_author(
         _add_field(body, "include_translation_fields", include_translation_fields)
         _add_field(body, "include_nlp_data", include_nlp_data)
         _add_field(body, "has_nlp", has_nlp)
-        _add_list_field(body, "theme", theme)
-        _add_list_field(body, "not_theme", not_theme)
+        _add_comma_list_field(body, "theme", theme)
+        _add_comma_list_field(body, "not_theme", not_theme)
         _add_field(body, "ner_name", ner_name)
         _add_field(body, "title_sentiment_min", title_sentiment_min)
         _add_field(body, "title_sentiment_max", title_sentiment_max)
@@ -1251,7 +1378,7 @@ async def search_by_link(
     page: int = 1,
     page_size: int = 100,
     robots_compliant: bool | None = None,
-    fields: list[str] | None = None,
+    fields: list[str] | None = DEFAULT_ARTICLE_FIELDS,
 ) -> str:
     """
     Look up specific, already-known articles by NewsCatcher id or URL.
@@ -1287,6 +1414,7 @@ async def search_by_link(
     """
     try:
         validate_ids_or_links(ids, links)
+        validate_fields(fields)
         validate_page_params(page, page_size)
 
         body: dict[str, Any] = {"page": page, "page_size": page_size}
@@ -1341,7 +1469,10 @@ async def list_sources(
             NEWS_API_KEY env var.
         lang: Include only sources publishing in these ISO 639-1 language codes.
         countries: Include only sources in these ISO 3166-1 alpha-2 countries.
-        predefined_sources: Top-N sources per country, e.g. ["top 50 US"].
+        predefined_sources: Top-N sources per country, e.g. ["top 50 US"]. Use when
+            the user wants "top"/"major"/"reputable" sources for a country rather
+            than a specific list -- prefer this over enumerating domains by hand
+            via `source_url`.
         source_name: Fuzzy (partial) match on publisher display name -- use for
             broad discovery, e.g. source_name="sport" finds any source with
             "sport" in its name.
@@ -1395,7 +1526,7 @@ async def list_sources(
         body: dict[str, Any] = {}
         _add_list_field(body, "lang", lang)
         _add_list_field(body, "countries", countries)
-        _add_list_field(body, "predefined_sources", predefined_sources)
+        _add_comma_list_field(body, "predefined_sources", predefined_sources)
         _add_field(body, "source_name", source_name)
         _add_list_field(body, "source_url", source_url)
         _add_field(body, "include_additional_info", include_additional_info)
@@ -1481,12 +1612,22 @@ async def get_aggregation_count(
         api_token: News API token. Optional if provided via x-api-token header or
             NEWS_API_KEY env var.
         aggregation_by: Bucket size: "day" (default), "hour", or "month".
-        search_in: Which fields to search q in. Max 2 of: title, content, summary,
-            title_content (default), title_translated, content_translated,
-            summary_translated, title_content_translated. For multilingual coverage,
-            pass ["title_content", "title_content_translated"] to search original and
-            translated text together (see this server's instructions).
-        predefined_sources: Top-N sources per country, e.g. ["top 50 US"].
+        search_in: Which fields to search q in. Leave unset for most queries -- the
+            default (title_content) already covers title+content, the right breadth
+            for standard recall. Narrow to ["title"] for high-precision matching on
+            one specific company/event/person (fewer, more substantively-relevant
+            hits, not passing mentions). For multilingual coverage with an
+            English-language query, use ["title_translated"] or
+            ["title_content_translated"] alone, or add one to the default (e.g.
+            ["title_content", "title_content_translated"]) to search original and
+            translated text together in one call. Max 2 values. Full value list:
+            title, content, summary, title_content (default), title_translated,
+            content_translated, summary_translated, title_content_translated (see
+            this server's instructions).
+        predefined_sources: Top-N sources per country, e.g. ["top 50 US"]. Use when
+            the user wants "top"/"major"/"reputable" sources for a country rather
+            than a specific list -- prefer this over enumerating domains by hand
+            via `sources`.
         sources: Include only these domains/subdomains.
         not_sources: Exclude these domains/subdomains.
         lang: Include only these ISO 639-1 language codes.
@@ -1560,8 +1701,8 @@ async def get_aggregation_count(
 
         body: dict[str, Any] = {"q": q, "page": page, "page_size": page_size}
         _add_field(body, "aggregation_by", aggregation_by)
-        _add_list_field(body, "search_in", search_in)
-        _add_list_field(body, "predefined_sources", predefined_sources)
+        _add_comma_list_field(body, "search_in", search_in)
+        _add_comma_list_field(body, "predefined_sources", predefined_sources)
         _add_list_field(body, "sources", sources)
         _add_list_field(body, "not_sources", not_sources)
         _add_list_field(body, "lang", lang)
@@ -1588,8 +1729,8 @@ async def get_aggregation_count(
         _add_field(body, "word_count_max", word_count_max)
         _add_field(body, "include_nlp_data", include_nlp_data)
         _add_field(body, "has_nlp", has_nlp)
-        _add_list_field(body, "theme", theme)
-        _add_list_field(body, "not_theme", not_theme)
+        _add_comma_list_field(body, "theme", theme)
+        _add_comma_list_field(body, "not_theme", not_theme)
         _add_field(body, "ORG_entity_name", org_entity_name)
         _add_field(body, "PER_entity_name", per_entity_name)
         _add_field(body, "LOC_entity_name", loc_entity_name)

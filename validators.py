@@ -266,6 +266,97 @@ def validate_search_in(values: list[str] | None) -> None:
         raise ValueError(f"search_in accepts at most 2 values, got {len(values)}: {values}")
 
 
+# --- `fields` (output projection) allowlist ----------------------------------
+# Unlike theme/search_in (open `string` filter values -- see module docstring),
+# `fields` selects actual keys off a fixed article object, confirmed live with
+# every enrichment flag on (include_nlp_data, include_translation_fields,
+# exclude_duplicates). This IS a closed set in the same sense as lang/country,
+# just structural rather than documented -- and the failure mode for getting it
+# wrong is worse than a 422: News API v3's `_source` mechanism silently drops
+# any unmatched path with no error at all, so a typo'd or guessed field name
+# (an LLM caller copying a name it assumes exists, e.g. "summary") produces a
+# quietly incomplete result instead of a corrective error. Re-sync this set if
+# the API adds fields.
+ARTICLE_FIELDS = frozenset(
+    """
+    id title author authors journalists published_date published_date_precision
+    updated_date updated_date_precision parent_url link domain_url
+    full_domain_url name_source country rights rank media description content
+    word_count language twitter_account is_headline is_opinion paid_content
+    score all_links all_domain_links nlp duplicate_count
+    duplicate_articles_group_id title_translated_en content_translated_en
+    """.split()
+)
+
+# nlp.* sub-fields (dotted path, e.g. "nlp.summary") -- confirmed live with
+# include_nlp_data=True and include_translation_fields=True.
+NLP_SUBFIELDS = frozenset(
+    """
+    theme sentiment summary ner_ORG ner_PER ner_LOC ner_MISC
+    translation_summary translation_ner_ORG translation_ner_PER
+    translation_ner_LOC translation_ner_MISC
+    """.split()
+)
+
+# Server-enforced default `fields` value for search_articles/get_latest_headlines/
+# get_breaking_news/search_by_author/search_by_link -- applied whenever a caller
+# omits `fields`, trimming the ~40-field article object down to a lean, generally-
+# useful default instead of returning everything. Includes both nlp.summary and
+# nlp.translation_summary so non-English articles still get a usable summary field
+# (nlp.translation_summary is empty unless include_translation_fields=True, which
+# these tools also default to True) -- when displaying results, use whichever of
+# the two is actually populated. Pass fields=[] explicitly to opt out and get the
+# full, untrimmed object (e.g. when the user wants to see everything available).
+DEFAULT_ARTICLE_FIELDS: list[str] = [
+    "title",
+    "link",
+    "published_date",
+    "domain_url",
+    "author",
+    "language",
+    "nlp.summary",
+    "nlp.translation_summary",
+    "nlp.theme",
+]
+
+# Known naming traps: a value a caller would reasonably guess exists but
+# doesn't, mapped to what to use instead.
+_FIELD_HINTS: dict[str, str] = {
+    "summary": (
+        'there is no top-level "summary" field -- use "description" for the '
+        'short lede, or the dotted path "nlp.summary" for the AI-generated '
+        "summary (needs include_nlp_data=True, the default)"
+    ),
+}
+
+
+def validate_fields(values: list[str] | None) -> None:
+    """Reject a `fields` projection request containing a field name that isn't
+    a real key on the article object (or a real nlp.* sub-field), with a
+    corrective message -- see the ARTICLE_FIELDS comment for why this closed
+    set is validated unlike theme/search_in."""
+    if not values:
+        return
+    bad = [
+        v
+        for v in values
+        if v not in ARTICLE_FIELDS
+        and not (v.startswith("nlp.") and v[len("nlp.") :] in NLP_SUBFIELDS)
+    ]
+    if not bad:
+        return
+    hints = [_FIELD_HINTS[b] for b in bad if b in _FIELD_HINTS]
+    message = f"fields has unrecognized value(s) {bad}."
+    if hints:
+        message += " " + " ".join(hints)
+    else:
+        message += (
+            " Valid top-level fields: " + ", ".join(sorted(ARTICLE_FIELDS))
+            + '. For NLP sub-fields use a dotted path, e.g. "nlp.summary", "nlp.theme".'
+        )
+    raise ValueError(message)
+
+
 def _validate_codes(
     values: list[str] | None, allowed_lower: frozenset[str], field_name: str, hint: str
 ) -> None:

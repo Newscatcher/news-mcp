@@ -28,3 +28,13 @@ class TestGetBreakingNews:
         text = call_result_text(result)
         assert text.startswith("Error:")
         assert "1000" in text
+
+    async def test_fields_projects_requested_keys(self, mcp):
+        """Regression: fields was a silent no-op here -- _project_result didn't
+        know about this tool's breaking_news_events[].articles response shape,
+        so the full ~40-field article always passed through untrimmed."""
+        result = await mcp.call_tool("get_breaking_news", {"page_size": 3, "fields": ["title", "nlp"]})
+        data = call_result_json(result)
+        for event in data["breaking_news_events"]:
+            for article in event["articles"]:
+                assert set(article.keys()) <= {"title", "nlp"}
