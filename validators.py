@@ -409,6 +409,20 @@ def validate_top_n_articles_page_size(top_n_articles: int | None, page_size: int
         )
 
 
+def validate_cluster_top_n_articles(value: int | None) -> None:
+    """search_articles/get_latest_headlines: client-side per-cluster article cap.
+
+    Unlike get_breaking_news's top_n_articles (a native upstream request param),
+    News API v3 has no server-side knob to limit how many articles come back
+    inside each cluster on search/latest_headlines -- this is trimmed client-side
+    after the fact (see server._trim_cluster_articles). None means no cap (keep
+    every article the API put in each cluster); anything else must be >= 1, since
+    0 or negative would silently produce clusters with no visible articles.
+    """
+    if value is not None and value < 1:
+        raise ValueError(f"cluster_top_n_articles must be >= 1 (pass None for no cap), got {value}")
+
+
 def validate_ids_or_links(ids: list[str] | None, links: list[str] | None) -> None:
     """search_by_link requires exactly one of ids/links -- documented as
     mutually exclusive ("either ... but not both")."""

@@ -69,20 +69,29 @@ headlines only), `exclude_duplicates` (search only), or by requesting
 API token precedence (highest to lowest):
 
 1. `api_token` tool parameter
-2. `x-api-token` request header
-3. `Authorization: Bearer <token>` request header
-4. URL query parameter `?apiToken=...`
+2. URL query parameter `?apiToken=...` — direct server access only (see note below)
+3. `x-api-token` request header
+4. `Authorization: Bearer <token>` request header
 5. `NEWS_API_KEY` environment variable
 
 `check_health` is the only tool that does not require an API token — it's a local
 liveness ping that never calls the News API (News API v3 has no public
 health/version endpoint).
 
+**`?apiToken=` outranks the header options, not the other way around.** If a
+direct-server-access request includes `?apiToken=`, it wins over an
+`x-api-token`/`Authorization` header sent on that same request — and, since
+the token from a session's `initialize` request is remembered for the rest of
+that session, it keeps winning over headers sent on later requests in that
+session too. Don't send both if you want the header to take effect.
+
 ### Hosted deployment (FastMCP Gateway)
 
 If you deploy this behind a stateless gateway (e.g. fastmcp.app), the gateway
-forwards HTTP headers to the backend but **not** URL query parameters. Use the
-`x-api-token` header or `NEWS_API_KEY` environment variable instead of `?apiToken=`.
+forwards HTTP headers to the backend but **not** URL query parameters. `?apiToken=`
+therefore never reaches this server in that setup, which makes the `x-api-token`
+header effectively the top priority there. Use the `x-api-token` header or
+`NEWS_API_KEY` environment variable instead of `?apiToken=`.
 
 ```json
 {
@@ -96,7 +105,9 @@ forwards HTTP headers to the backend but **not** URL query parameters. Use the
 }
 ```
 
-**Direct server access** (no gateway): `?apiToken=YOUR_TOKEN` in the URL still works.
+**Direct server access** (no gateway): `?apiToken=YOUR_TOKEN` in the URL still
+works, but per the precedence note above, it will shadow any `x-api-token`/
+`Authorization` header you also send for the life of that session.
 
 ## Configuration
 
@@ -134,10 +145,28 @@ forwards HTTP headers to the backend but **not** URL query parameters. Use the
   - `clustering_enabled=true` changes the response shape to `clusters_count` +
     `clusters` (each `{cluster_id, cluster_size, articles}`) instead of a flat
     `articles` list — pass `clustering_enabled=false` for a plain list.
+  - `search_articles`/`get_latest_headlines` default to `clustering_enabled=true`,
+    `page_size=50`, and `cluster_top_n_articles=3` — tuned for a broad/basic
+    request (grouped topic coverage without flooding the response). When the user
+    wants direct articles or cares about specific sources instead (tracking one
+    outlet, precise source-checking, "did X cover this"), pass
+    `clustering_enabled=false` and `page_size=20` for a plain, ungrouped list —
+    otherwise the specific article/source they're after could be hidden by the
+    `cluster_top_n_articles` cap if it isn't among the top 3 in its cluster.
+  - **Clustering reorganizes results, it doesn't shrink them** — News API groups
+    every matched article into a cluster, it drops none, so `page_size=50`
+    grouped into 25 clusters is still ~50 full article objects on the wire. On
+    `search_articles`/`get_latest_headlines`, `cluster_top_n_articles` caps each
+    cluster's `articles` list client-side (default `3`) so one heavily-syndicated
+    story's cluster can't fill the whole response with near-duplicate coverage;
+    `cluster_size` is untouched, so the true total per cluster is still visible.
+    Pass `cluster_top_n_articles=None` for no cap. (`get_breaking_news` has its
+    own, API-native equivalent: `top_n_articles`.)
   - Clustering and `exclude_duplicates` solve the same near-duplicate-coverage
     problem differently rather than being strictly complementary: clustering
-    groups related articles (all kept, reorganized into groups), `exclude_duplicates`
-    removes near-identical ones (fewer articles, stays flat).
+    groups related articles (kept, reorganized into groups, then capped
+    per-cluster as above), `exclude_duplicates` removes near-identical ones
+    outright (fewer articles, stays flat).
   - `clustering_variable` is deprecated (ignored) for articles published on or
     after 2026-01-01; a date range cannot straddle 2026-01-01 when clustering is
     enabled — the API rejects it.
