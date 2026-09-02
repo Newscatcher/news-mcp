@@ -141,7 +141,8 @@ works, but per the precedence note above, it will shadow any `x-api-token`/
   Pass `false` explicitly to opt out of any of these. All five tools that accept
   `fields` (the four above plus `search_by_link`) also default it to a lean set
   instead of the full object — see [Output Projection](#output-projection-fields)
-  below; pass `fields=[]` to opt out.
+  below; pass `fields=[]` **or** `fields=null` to opt out. Simply omitting `fields`
+  from the call does not opt out — it applies the lean default like any other call.
   - `clustering_enabled=true` changes the response shape to `clusters_count` +
     `clusters` (each `{cluster_id, cluster_size, articles}`) instead of a flat
     `articles` list — pass `clustering_enabled=false` for a plain list.
@@ -305,8 +306,11 @@ trims client-side since that endpoint has no `_source` equivalent).
 - **Defaults to a lean, generally-useful set** — `title`, `link`,
   `published_date`, `domain_url`, `author`, `language`, `nlp.summary`,
   `nlp.translation_summary`, `nlp.theme` — instead of the full object. Pass
-  `fields=[]` explicitly to opt out and get everything (e.g. the user asks what
-  else is available, or wants to see everything).
+  `fields=[]` **or** `fields=null` explicitly to opt out and get everything
+  (e.g. the user asks what else is available, or wants to see everything).
+  **Simply omitting `fields` from the call does not opt out** — it applies
+  this lean default the same as any other call; only an explicit `[]` or
+  `null` bypasses it.
 - The default carries both `nlp.summary` and `nlp.translation_summary` so
   non-English articles still get a usable summary — News API only populates one
   of the two per article (the other is `null`/absent), so when presenting

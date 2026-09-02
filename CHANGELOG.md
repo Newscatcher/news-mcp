@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.5] — 2026-09-02
+
+### Fixed
+- `fields` had no `Args:` docstring entry on any of the 5 tools that accept it
+  (`search_articles`, `get_latest_headlines`, `get_breaking_news`,
+  `search_by_author`, `search_by_link`), so FastMCP generated no schema
+  `description` for it at all -- confirmed by introspecting the live tool
+  schema (`fields` came back as a bare `anyOf`/`default` with no
+  `description` key, unlike every other parameter). An agent reading only
+  the per-parameter schema, rather than the long prose "Key rules" section,
+  saw `fields` with zero explanation. Found via a question about whether
+  `fields=null` returns all fields.
+
+### Docs
+- Every `fields` entry (new Args docstrings, the shared server instructions,
+  README) now states explicitly: `fields=[]` **or** `fields=null` (both
+  behave identically -- `build_source`/`_project_result` treat `None` and
+  `[]` the same, `if not fields`) return full, untrimmed objects, but
+  **simply omitting `fields` from the call does not** -- omission applies
+  the tool's own default, `DEFAULT_ARTICLE_FIELDS` (the lean 9-key set),
+  the same as any other call. This distinction (explicit `null`/`[]` vs.
+  omission) was previously undocumented and is easy to get backwards.
+
+---
+
 ## [0.4.4] — 2026-09-02
 
 ### Changed
