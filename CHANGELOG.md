@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.6] — 2026-09-03
+
+### Added
+- PostHog MCP Analytics. `posthog.mcp.instrument()` wraps the server, so every
+  invocation lands as one `$mcp_tool_call` (tool name, parameters, response, duration,
+  error flag) alongside `$mcp_initialize`, `$mcp_tools_list` and `$exception`. Events go
+  to the PostHog project named by `POSTHOG_PROJECT_API_KEY`; `POSTHOG_HOST` picks the
+  region (defaults to `https://us.i.posthog.com`). See README "Analytics (optional)".
+  - **Off by default.** No key, no analytics, no behaviour change — and any failure
+    while wiring it up is logged and swallowed rather than taking the server down.
+  - **Observation only.** `context`, `enable_conversation_id`, and `report_missing` are
+    pinned off in `MCPAnalyticsOptions`, since each would otherwise inject an argument
+    or an extra tool into the schema callers see (`context` defaults to `True`
+    upstream). `tools/list` is unchanged with analytics on or off.
+  - `instrument()` runs before `mcp.http_app` is monkey-patched (for
+    `ApiTokenASGIMiddleware`) and before `app = mcp.http_app()` builds the ASGI app — it
+    wraps FastMCP's app factories to install PostHog's stateless-session middleware,
+    which mints the `Mcp-Session-Id` token that stitches `$session_id` and identity
+    together across requests. Verified both middlewares end up on the built app in the
+    right order.
+  - A small ASGI middleware (`_AnalyticsFlushMiddleware`) flushes the client at the end
+    of each HTTP request, since PostHog's client batches on a background thread that a
+    frozen/recycled server instance may never get to run again.
+  - Callers are attributed pseudonymously by API token, since every tool but
+    `check_health` requires one: `distinct_id` is an HMAC of the token
+    (`auth: keyed`), optionally salted by `POSTHOG_IDENTITY_SALT`. The raw token is
+    never sent. A call with no resolvable token stays anonymous rather than
+    attributed. No client-IP fallback — this server is only ever called with a
+    token, so there is no meaningful keyless caller to identify by IP.
+  - Credentials are not captured: the SDK redacts any argument whose key looks like an
+    api key or token before the event leaves the process.
+  - **Not** wired via `npx @posthog/wizard mcp-analytics` — that wizard's OAuth
+    login/codegen flow only targets TypeScript/JavaScript servers built on
+    `@modelcontextprotocol/sdk`, and does nothing useful against this Python `fastmcp`
+    server. The `posthog.mcp` module is the Python path instead; no login step, just a
+    static Project API key.
+
+### Changed
+- Added `posthog==7.39.1` to `requirements.txt`.
+
 ## [0.4.5] — 2026-09-02
 
 ### Fixed

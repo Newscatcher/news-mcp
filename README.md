@@ -114,6 +114,57 @@ works, but per the precedence note above, it will shadow any `x-api-token`/
 - `NEWS_API_BASE_URL` — overrides the upstream News API v3 base URL (defaults to
   `https://v3-api.newscatcherapi.com`). Only needed to point at a non-default
   environment.
+- `POSTHOG_PROJECT_API_KEY`, `POSTHOG_HOST`, `POSTHOG_IDENTITY_SALT` — optional,
+  see [Analytics](#analytics-optional) below.
+
+## Analytics (optional)
+
+The server can report its own usage to [PostHog MCP Analytics](https://posthog.com/docs/mcp-analytics):
+which tools agents call, parameters, how long calls took, and what failed.
+
+Set one environment variable to turn it on:
+
+```bash
+export POSTHOG_PROJECT_API_KEY=phc_your-project-api-key
+# export POSTHOG_HOST=https://eu.i.posthog.com   # default is https://us.i.posthog.com
+```
+
+With no key the server runs exactly as it does without PostHog installed — nothing is
+sent, and a failure to initialize analytics is logged and ignored rather than failing a
+request.
+
+> **Not** wired via `npx @posthog/wizard mcp-analytics` — that wizard only instruments
+> TypeScript/JavaScript servers built on `@modelcontextprotocol/sdk`. This is a Python
+> `fastmcp` server, so `server.py` calls `posthog.mcp.instrument()` directly instead.
+> There is no login/OAuth step for this path: the `POSTHOG_PROJECT_API_KEY` value itself
+> (a write-only Project API key from PostHog → Project Settings) is what authenticates
+> the outbound events.
+
+| Event | When |
+| --- | --- |
+| `$mcp_tool_call` | Every tool invocation — tool name, parameters, response, duration, error flag |
+| `$mcp_initialize` | A client completes the handshake — carries client name and version |
+| `$mcp_tools_list` | A client lists the tools |
+| `$exception` | A tool raised — paired with the failing `$mcp_tool_call` |
+
+**Analytics never changes the tool contract.** The SDK can otherwise inject arguments
+into your tools (a `context` argument for the agent to state intent, a
+`conversation_id`, an extra virtual `get_more_tools` tool). All three are pinned off in
+`server.py`, so `tools/list` returns identical schemas whether analytics is on or off.
+
+**Who the events are attributed to.** Every tool but `check_health` requires an API
+token, so callers are attributed pseudonymously by token: `distinct_id` is
+`key_<hmac>` of the caller's token (`auth: keyed`). A call with no resolvable token
+(only `check_health`, in practice) stays anonymous. The raw token is never sent —
+only an HMAC digest. `POSTHOG_IDENTITY_SALT` (any long random string) is optional:
+tokens are already high-entropy enough to not need one to be unguessable, but set one
+if you want the digest to change on a predictable token rotation.
+
+**What leaves the process.** API tokens do not: the SDK redacts any argument whose key
+looks like an api key or token before an event leaves the process. Search queries and
+returned article/story content *are* captured in `$mcp_parameters` and `$mcp_response`
+— that is caller content. Pass a `before_send` hook to `MCPAnalyticsOptions` in
+`server.py` if you need to strip or hash fields before they are sent.
 
 ## Query Workflow Tips
 

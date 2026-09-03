@@ -26,7 +26,10 @@ highest priority there.
 from __future__ import annotations
 
 import contextvars
+import hashlib
+import hmac
 import json
+import logging
 import os
 from typing import Any
 from urllib.parse import parse_qs
@@ -35,6 +38,8 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp.server.http import _current_http_request
 from starlette.middleware import Middleware as StarletteMiddleware
+
+logger = logging.getLogger("news-mcp")
 
 from validators import (
     AGGREGATION_BY_VALUES,
@@ -1941,6 +1946,131 @@ async def check_health(api_token: str = "") -> str:
     return json.dumps({"status": "ok", "server": "news-mcp"}, indent=2)
 
 
+def _identity_salt() -> str | None:
+    """HMAC key for pseudonymous analytics ids, if one is configured."""
+    raw = os.getenv("POSTHOG_IDENTITY_SALT")
+    return raw.strip() if raw and raw.strip() else None
+
+
+def _identity_digest(value: str, salt: str) -> str:
+    """Derive a stable, non-reversible analytics id from a caller's API token."""
+    digest = hmac.new(salt.encode("utf-8"), value.encode("utf-8"), hashlib.sha256)
+    return f"key_{digest.hexdigest()[:16]}"
+
+
+async def _analytics_identity(request: dict[str, Any], extra: dict[str, Any] | None = None) -> Any:
+    """Resolve who is calling, for PostHog's ``identify`` hook.
+
+    Every tool except `check_health` requires an API token, so identity is always
+    keyed: an HMAC of the caller's token. The raw token is never sent to PostHog.
+    `POSTHOG_IDENTITY_SALT` is optional here -- API tokens are high-entropy enough
+    to not need a salt to be unguessable -- but set one if you want the digest to
+    change if a token is ever rotated in a predictable way.
+
+    A `check_health` call (or any call with no resolvable token) leaves the
+    session anonymous rather than attributed.
+    """
+    from posthog.mcp import UserIdentity
+
+    token = _token_from_session()
+    if not token:
+        return None
+    return UserIdentity(
+        distinct_id=_identity_digest(token, _identity_salt() or ""),
+        properties={"auth": "keyed"},
+    )
+
+
+# --- PostHog MCP analytics ----------------------------------------------------------------
+# Optional and self-disabling: with no POSTHOG_PROJECT_API_KEY the server behaves exactly as
+# it did before. instrument() captures one $mcp_tool_call per invocation (tool name,
+# parameters, response, duration, error flag), plus $mcp_initialize, $mcp_tools_list and
+# $exception, sent to the PostHog project named by the key.
+#
+# NOT wired via `npx @posthog/wizard mcp-analytics` -- that wizard only instruments
+# TypeScript/JavaScript servers built on `@modelcontextprotocol/sdk`. This is a Python
+# `fastmcp` server, so it uses the `posthog.mcp` module directly instead.
+#
+# instrument() MUST run before the ASGI app is built and before mcp.http_app is
+# monkey-patched below: it wraps FastMCP's app factories to install PostHog's
+# stateless-session middleware, which mints the Mcp-Session-Id token that stitches
+# $session_id and client identity together across requests. Running it after either of
+# those would silently lose that wrapping.
+POSTHOG_HOST = os.getenv("POSTHOG_HOST", "https://us.i.posthog.com")
+
+
+def _init_analytics() -> Any | None:
+    """Instrument ``mcp`` for PostHog MCP analytics when a project key is configured.
+
+    Returns:
+        Any | None: The PostHog client to flush per request, or None when analytics
+            are disabled or could not be wired up.
+    """
+    key = os.getenv("POSTHOG_PROJECT_API_KEY", "").strip()
+    if not key:
+        logger.info("PostHog MCP analytics disabled: POSTHOG_PROJECT_API_KEY is not set")
+        return None
+    try:
+        from posthog import Client
+        from posthog.mcp import MCPAnalyticsOptions, instrument
+
+        client = Client(key, host=POSTHOG_HOST)
+        instrument(
+            mcp,
+            client,
+            MCPAnalyticsOptions(
+                # Analytics observes; it never shapes the tool contract. Each of these
+                # would otherwise change what callers see:
+                #   context                -> injects a `context` argument into every tool
+                #                             (defaults to True upstream)
+                #   enable_conversation_id -> injects a `conversation_id` argument
+                #   report_missing         -> advertises an extra virtual `get_more_tools` tool
+                # Pinned explicitly so an SDK release can't silently start editing our schema.
+                context=False,
+                enable_conversation_id=False,
+                report_missing=False,
+                identify=_analytics_identity,
+            ),
+        )
+    except Exception as exc:
+        # Analytics must never take the server down.
+        logger.warning("PostHog MCP analytics could not be initialized; serving without it: %s", exc)
+        return None
+    logger.info(
+        "PostHog MCP analytics enabled (host=%s, salted_identity=%s)",
+        POSTHOG_HOST,
+        bool(_identity_salt()),
+    )
+    return client
+
+
+_posthog_client = _init_analytics()
+
+
+class _AnalyticsFlushMiddleware:
+    """Flush queued analytics events at the end of each HTTP request.
+
+    The PostHog client batches events on a background thread, but a hosted/serverless
+    instance can be frozen or recycled right after its response is sent, dropping
+    whatever is still queued. Flushing here costs the caller nothing extra and makes
+    delivery deterministic.
+    """
+
+    def __init__(self, app: Any, client: Any) -> None:
+        self.app = app
+        self.client = client
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if scope.get("type") == "http":
+                try:
+                    self.client.flush()
+                except Exception as exc:
+                    logger.warning("PostHog event flush failed: %s", exc)
+
+
 # Patch mcp.http_app to always inject ApiTokenASGIMiddleware, regardless of how the
 # server is invoked (uvicorn server:app, fastmcp run server.py:mcp, python server.py, etc.)
 _original_http_app = mcp.http_app
@@ -1957,6 +2087,8 @@ mcp.http_app = _http_app_with_api_token_middleware  # type: ignore[method-assign
 
 # Module-level ASGI app for deployment via `uvicorn server:app`
 app = mcp.http_app()
+if _posthog_client is not None:
+    app.add_middleware(_AnalyticsFlushMiddleware, client=_posthog_client)
 
 
 if __name__ == "__main__":
