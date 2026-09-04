@@ -114,7 +114,7 @@ works, but per the precedence note above, it will shadow any `x-api-token`/
 - `NEWS_API_BASE_URL` — overrides the upstream News API v3 base URL (defaults to
   `https://v3-api.newscatcherapi.com`). Only needed to point at a non-default
   environment.
-- `POSTHOG_PROJECT_API_KEY`, `POSTHOG_HOST`, `POSTHOG_IDENTITY_SALT` — optional,
+- `POSTHOG_PROJECT_API_KEY`, `POSTHOG_HOST`, `POSTHOG_TOKEN_PASSPHRASE` — optional,
   see [Analytics](#analytics-optional) below.
 - `MAX_RESPONSE_BYTES` — caps a tool response's serialized size (default `250000`
   bytes). See [Response size cap](#response-size-cap) below.
@@ -187,12 +187,45 @@ into your tools (a `context` argument for the agent to state intent, a
 `server.py`, so `tools/list` returns identical schemas whether analytics is on or off.
 
 **Who the events are attributed to.** Every tool but `check_health` requires an API
-token, so callers are attributed pseudonymously by token: `distinct_id` is
-`key_<hmac>` of the caller's token (`auth: keyed`). A call with no resolvable token
-(only `check_health`, in practice) stays anonymous. The raw token is never sent —
-only an HMAC digest. `POSTHOG_IDENTITY_SALT` (any long random string) is optional:
-tokens are already high-entropy enough to not need one to be unguessable, but set one
-if you want the digest to change on a predictable token rotation.
+token. When `POSTHOG_TOKEN_PASSPHRASE` is set, `distinct_id` is that token
+**symmetrically encrypted** (PBKDF2-HMAC-SHA256 → Fernet/AES) and sent as
+`enc_<ciphertext>` (`auth: keyed`). Without a passphrase configured, or for a call with
+no resolvable token (`check_health`), the session stays anonymous.
+
+> ⚠️ **This is reversible by design, not a pseudonymous hash.** Unlike a one-way digest,
+> `enc_<ciphertext>` decrypts back to the caller's actual, live API token for anyone who
+> holds `POSTHOG_TOKEN_PASSPHRASE` — including a PostHog employee you hand the passphrase
+> to. That token can make real, billable calls against that customer's News API account.
+> This tradeoff was made deliberately and explicitly, after the alternative (a one-way
+> HMAC, or a private lookup table kept outside PostHog) was raised and declined — see
+> CHANGELOG.md. Treat `POSTHOG_TOKEN_PASSPHRASE` as a live credential itself: generate it
+> with `python -c "import secrets; print(secrets.token_urlsafe(32))"` (never a memorable
+> phrase), store it the same way you'd store any other production secret, and if it is
+> ever exposed, rotate it *and* rotate any customer API tokens that may have been
+> decryptable during the exposure window (past events encrypted under the old passphrase
+> become permanently undecryptable once you rotate it).
+
+**To decrypt a `distinct_id` back to the original token** (needs `POSTHOG_TOKEN_PASSPHRASE`
+and the `cryptography` package):
+```python
+import base64
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+passphrase = "..."  # the value of POSTHOG_TOKEN_PASSPHRASE
+distinct_id = "enc_..."  # from a PostHog event, minus the "enc_" prefix
+
+kdf = PBKDF2HMAC(
+    algorithm=hashes.SHA256(),
+    length=32,
+    salt=b"news-mcp-posthog-token-cipher-v1",  # fixed, not secret -- see server.py
+    iterations=390_000,
+)
+key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
+token = Fernet(key).decrypt(distinct_id.removeprefix("enc_").encode("utf-8")).decode("utf-8")
+print(token)  # the caller's actual News API token
+```
 
 **What leaves the process.** API tokens do not: the SDK redacts any argument whose key
 looks like an api key or token before an event leaves the process. Search queries and
