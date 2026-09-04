@@ -61,7 +61,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `_trim_cluster_articles`), which trims trailing entries from whichever of `articles`,
   `clusters`, or `breaking_news_events` is present (the same three shapes
   `_project_result` already understands) until the response fits under
-  `MAX_RESPONSE_BYTES` (env-configurable, default 60000).
+  `MAX_RESPONSE_BYTES` (env-configurable, default 250000).
   - Structure-aware, not a byte slice: always produces valid, still-parseable JSON.
     Never touches per-article field content, only how many articles come back.
   - Ratio-based trim (`target_len = floor(len(items) * max_bytes/total * 0.9)`), not a
@@ -82,8 +82,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     its 1MB default) is also registered as a coarse backstop behind this -- it does a
     byte-blind truncation with no JSON-awareness, so it's a last resort for a shape the
     structured cap above doesn't know about, not the primary mechanism.
-- `MAX_RESPONSE_BYTES` env var (default `60000`) controls the structured cap's
-  threshold. See README "Response size cap".
+- `MAX_RESPONSE_BYTES` env var (default `250000`, ~60k tokens) controls the structured
+  cap's threshold -- sized as a safety net against an unbounded "give me all articles"
+  response, not to fill a large model's context window; raise it via the env var if a
+  deployment wants more headroom. See README "Response size cap".
 
 ### Fixed
 - The `fastmcp`-not-installed test stub in `tests/test_server.py` (`_install_test_stubs`)

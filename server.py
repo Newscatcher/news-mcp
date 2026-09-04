@@ -83,7 +83,7 @@ API_BASE_URL = os.getenv("NEWS_API_BASE_URL") or "https://v3-api.newscatcherapi.
 # Hard cap on a tool response's serialized size (bytes), so a broad query (e.g.
 # fields=[], page_size=1000, no filters) can't return an unbounded payload. See
 # _cap_response_size.
-MAX_RESPONSE_BYTES = int(os.getenv("MAX_RESPONSE_BYTES", "60000"))
+MAX_RESPONSE_BYTES = int(os.getenv("MAX_RESPONSE_BYTES", "250000"))
 
 
 class ApiTokenASGIMiddleware:

@@ -116,7 +116,7 @@ works, but per the precedence note above, it will shadow any `x-api-token`/
   environment.
 - `POSTHOG_PROJECT_API_KEY`, `POSTHOG_HOST`, `POSTHOG_IDENTITY_SALT` — optional,
   see [Analytics](#analytics-optional) below.
-- `MAX_RESPONSE_BYTES` — caps a tool response's serialized size (default `60000`
+- `MAX_RESPONSE_BYTES` — caps a tool response's serialized size (default `250000`
   bytes). See [Response size cap](#response-size-cap) below.
 
 ## Response size cap
@@ -137,7 +137,7 @@ happened:
 ```json
 {
   "response_capped": {
-    "reason": "response exceeded the 60000-byte cap",
+    "reason": "response exceeded the 250000-byte cap",
     "kept": 42,
     "dropped": 958,
     "hint": "narrow the query (add filters, pass fields=[...] instead of fields=[], or reduce page_size) to get more back in one call, or paginate with `page`"
