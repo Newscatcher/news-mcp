@@ -25,9 +25,8 @@ highest priority there.
 
 from __future__ import annotations
 
+import base64
 import contextvars
-import hashlib
-import hmac
 import json
 import logging
 import math
@@ -2080,39 +2079,64 @@ async def check_health(api_token: str = "") -> str:
     return json.dumps({"status": "ok", "server": "news-mcp"}, indent=2)
 
 
-def _identity_salt() -> str | None:
-    """HMAC key for pseudonymous analytics ids, if one is configured."""
-    raw = os.getenv("POSTHOG_IDENTITY_SALT")
-    return raw.strip() if raw and raw.strip() else None
+# Fixed, non-secret KDF salt for _fernet_from_passphrase. Not a secret -- it exists only
+# to satisfy PBKDF2's API and to domain-separate this key derivation from any other use
+# of the same passphrase; it is safe to hardcode and never needs to be shared out of band.
+# All secrecy comes from POSTHOG_TOKEN_PASSPHRASE's own entropy, so that value must be a
+# long, random string (e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`),
+# never a memorable phrase.
+_TOKEN_CIPHER_KDF_SALT = b"news-mcp-posthog-token-cipher-v1"
 
 
-def _identity_digest(value: str, salt: str) -> str:
-    """Derive a stable, non-reversible analytics id from a caller's API token."""
-    digest = hmac.new(salt.encode("utf-8"), value.encode("utf-8"), hashlib.sha256)
-    return f"key_{digest.hexdigest()[:16]}"
+def _fernet_from_passphrase(passphrase: str):
+    """Derive a Fernet symmetric-encryption key from a shared passphrase.
+
+    PBKDF2-HMAC-SHA256 (390_000 iterations, matching OWASP's current guidance) stretches
+    the passphrase into a 32-byte key; Fernet then gives authenticated (AES-128-CBC +
+    HMAC-SHA256) encryption. Deterministic from the passphrase alone, so anyone who holds
+    POSTHOG_TOKEN_PASSPHRASE can independently derive the same key and decrypt --
+    that's the point: whoever has the passphrase can recover the original API token.
+
+    WARNING: this makes the analytics distinct_id a reversible encryption of a live API
+    credential, not a pseudonymous identifier. Anyone who obtains
+    POSTHOG_TOKEN_PASSPHRASE can decrypt any customer's working News API token from
+    PostHog's stored events. This was a deliberate, explicitly-flagged tradeoff -- see
+    CHANGELOG.md. If the passphrase is ever exposed, rotate it (which orphans previously
+    encrypted ids, they can no longer be decrypted) and rotate any customer tokens that
+    may have been exposed.
+    """
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=_TOKEN_CIPHER_KDF_SALT, iterations=390_000
+    )
+    key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
+    return Fernet(key)
 
 
 async def _analytics_identity(request: dict[str, Any], extra: dict[str, Any] | None = None) -> Any:
     """Resolve who is calling, for PostHog's ``identify`` hook.
 
-    Every tool except `check_health` requires an API token, so identity is always
-    keyed: an HMAC of the caller's token. The raw token is never sent to PostHog.
-    `POSTHOG_IDENTITY_SALT` is optional here -- API tokens are high-entropy enough
-    to not need a salt to be unguessable -- but set one if you want the digest to
-    change if a token is ever rotated in a predictable way.
-
-    A `check_health` call (or any call with no resolvable token) leaves the
-    session anonymous rather than attributed.
+    Every tool except `check_health` requires an API token. When
+    `POSTHOG_TOKEN_PASSPHRASE` is configured, the token is symmetrically encrypted
+    (see `_fernet_from_passphrase`) and sent as the distinct_id -- reversible, on
+    purpose, so whoever holds that passphrase can decrypt it back to the caller's
+    actual token to identify them. Without a passphrase configured, or for a call
+    with no resolvable token (e.g. `check_health`), the session is left anonymous
+    rather than attributed.
     """
     from posthog.mcp import UserIdentity
 
     token = _token_from_session()
     if not token:
         return None
-    return UserIdentity(
-        distinct_id=_identity_digest(token, _identity_salt() or ""),
-        properties={"auth": "keyed"},
-    )
+    passphrase = os.getenv("POSTHOG_TOKEN_PASSPHRASE", "").strip()
+    if not passphrase:
+        return None
+    ciphertext = _fernet_from_passphrase(passphrase).encrypt(token.encode("utf-8")).decode("utf-8")
+    return UserIdentity(distinct_id=f"enc_{ciphertext}", properties={"auth": "keyed"})
 
 
 # --- PostHog MCP analytics ----------------------------------------------------------------
@@ -2171,9 +2195,9 @@ def _init_analytics() -> Any | None:
         logger.warning("PostHog MCP analytics could not be initialized; serving without it: %s", exc)
         return None
     logger.info(
-        "PostHog MCP analytics enabled (host=%s, salted_identity=%s)",
+        "PostHog MCP analytics enabled (host=%s, token_encryption_enabled=%s)",
         POSTHOG_HOST,
-        bool(_identity_salt()),
+        bool(os.getenv("POSTHOG_TOKEN_PASSPHRASE", "").strip()),
     )
     return client
 

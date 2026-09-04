@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.9] — 2026-09-04
+
+### Changed
+- **Security-relevant, deliberate tradeoff.** PostHog analytics identity
+  (`_analytics_identity` in `server.py`) no longer sends a one-way HMAC digest of the
+  caller's API token. It now sends the token **reversibly encrypted**
+  (PBKDF2-HMAC-SHA256 → Fernet/AES, `_fernet_from_passphrase`) as
+  `distinct_id: enc_<ciphertext>`, gated on a new `POSTHOG_TOKEN_PASSPHRASE` env var
+  (replaces `POSTHOG_IDENTITY_SALT`, which is no longer read). Anyone holding that
+  passphrase -- including a third party the passphrase is shared with -- can decrypt a
+  `distinct_id` back to the customer's actual, live News API token.
+  - This was requested explicitly, after the tradeoff was raised directly and a
+    non-reversible alternative (keep the HMAC; maintain a private token-hash ->
+    customer lookup table internally, never shared with PostHog) was offered and
+    declined. Recorded here so the reasoning isn't lost.
+  - `POSTHOG_TOKEN_PASSPHRASE` must be treated as a production credential: generate it
+    with `secrets.token_urlsafe(32)` (never a memorable phrase -- the KDF salt is fixed
+    and public, so all security rests on the passphrase's entropy), store it like any
+    other secret, and rotate it (plus any customer tokens that may have been exposed)
+    if it's ever leaked. Rotating the passphrase permanently orphans previously-encrypted
+    `distinct_id`s -- they can no longer be decrypted, which is the intended failsafe.
+  - No passphrase configured -> anonymous, same graceful-degradation behavior as before
+    (no key, no attribution, no error).
+  - New dependency: `cryptography==49.0.0` (`requirements.txt`).
+  - README "Analytics (optional)" documents the new env var, a standalone decrypt
+    snippet, and the warning above.
+
 ## [0.4.8] — 2026-09-04
 
 ### Fixed
