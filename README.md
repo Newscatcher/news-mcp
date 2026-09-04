@@ -116,6 +116,40 @@ works, but per the precedence note above, it will shadow any `x-api-token`/
   environment.
 - `POSTHOG_PROJECT_API_KEY`, `POSTHOG_HOST`, `POSTHOG_IDENTITY_SALT` — optional,
   see [Analytics](#analytics-optional) below.
+- `MAX_RESPONSE_BYTES` — caps a tool response's serialized size (default `60000`
+  bytes). See [Response size cap](#response-size-cap) below.
+
+## Response size cap
+
+`page_size` (max 1000) and the lean default `fields` projection keep a single response
+reasonable, but a caller can still combine `fields=[]` (the documented full-object
+opt-out) with a large `page_size` and no filters — "give me all articles" — and get an
+arbitrarily large response. `search_articles`, `get_latest_headlines`, `get_breaking_news`,
+and `search_by_author` (the tools that return `articles`, `clusters[].articles`, or
+`breaking_news_events[].articles`) trim trailing entries from that list until the
+response fits under `MAX_RESPONSE_BYTES`, rather than returning an unbounded payload.
+
+This never touches per-article field content — only how many articles come back — and
+never fires on a response that already fits (the overwhelming majority of calls).
+When it does trim, the response carries a `response_capped` block explaining what
+happened:
+
+```json
+{
+  "response_capped": {
+    "reason": "response exceeded the 60000-byte cap",
+    "kept": 42,
+    "dropped": 958,
+    "hint": "narrow the query (add filters, pass fields=[...] instead of fields=[], or reduce page_size) to get more back in one call, or paginate with `page`"
+  }
+}
+```
+
+As a coarse backstop behind that, the server also registers FastMCP's built-in
+`ResponseLimitingMiddleware` at its 1MB default — it should essentially never fire (the
+structured cap above keeps every article-bearing tool far under it), but exists to catch
+a response shape the structured cap doesn't know about (e.g. an unusually large
+`list_sources` result with a broad filter).
 
 ## Analytics (optional)
 

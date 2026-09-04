@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 from typing import Any
 from urllib.parse import parse_qs
@@ -37,6 +38,7 @@ from urllib.parse import parse_qs
 import httpx
 from fastmcp import FastMCP
 from fastmcp.server.http import _current_http_request
+from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddleware
 from starlette.middleware import Middleware as StarletteMiddleware
 
 logger = logging.getLogger("news-mcp")
@@ -77,6 +79,11 @@ _session_api_tokens: dict[str, str] = {}
 
 # API Configuration
 API_BASE_URL = os.getenv("NEWS_API_BASE_URL") or "https://v3-api.newscatcherapi.com"
+
+# Hard cap on a tool response's serialized size (bytes), so a broad query (e.g.
+# fields=[], page_size=1000, no filters) can't return an unbounded payload. See
+# _cap_response_size.
+MAX_RESPONSE_BYTES = int(os.getenv("MAX_RESPONSE_BYTES", "60000"))
 
 
 class ApiTokenASGIMiddleware:
@@ -313,6 +320,13 @@ hand:
   plausibly spans multiple themes (e.g. Business and Politics).
 Decide per query, not as a fixed checklist — most requests still just need one well-formed call.""",
 )
+
+# Coarse, last-resort backstop behind _cap_response_size (see below): a byte-blind
+# truncation (not JSON-aware) that should essentially never fire, since the structured
+# cap already keeps every tool that returns articles well under this. Left at its
+# default (1MB) -- it only exists to catch a response shape _cap_response_size doesn't
+# know about (e.g. an unusually large list_sources/get_aggregation_count result).
+mcp.add_middleware(ResponseLimitingMiddleware())
 
 
 def _token_from_session() -> str:
@@ -562,6 +576,77 @@ def _trim_cluster_articles(result: Any, top_n: int | None) -> Any:
     return result
 
 
+def _cap_response_size(result: Any, max_bytes: int = MAX_RESPONSE_BYTES) -> Any:
+    """Trim a response's top-level list until it serializes under max_bytes.
+
+    Last line of defense against an unbounded payload (e.g. fields=[], page_size=1000,
+    no filters -- "give me all articles"). Recognizes the same three shapes
+    _project_result already knows -- a flat `articles` list, top-level `clusters`,
+    top-level `breaking_news_events` -- and drops trailing entries from whichever one
+    is present. It does not touch per-article field content (that's fields/
+    _project_result's job) or per-cluster article limits (that's
+    _trim_cluster_articles's job); this only fires when those still leave the response
+    too big.
+
+    No-op, result returned unchanged with no key added, when the response is already
+    under max_bytes, or when none of the three shapes are present (list_sources,
+    get_aggregation_count, get_subscription, check_health, search_by_link -- their
+    payload sizes are already bounded by upstream pagination, required filters, or a
+    small fixed shape).
+    """
+    if not isinstance(result, dict):
+        return result
+
+    def _size(value: Any) -> int:
+        return len(json.dumps(value).encode("utf-8"))
+
+    total = _size(result)
+    if total <= max_bytes:
+        return result
+
+    items: list | None = None
+    for key in ("articles", "clusters", "breaking_news_events"):
+        candidate = result.get(key)
+        if isinstance(candidate, list) and candidate:
+            items = candidate
+            break
+    if items is None:
+        return result
+
+    original_count = len(items)
+    # Scale the list length down by the overage ratio rather than re-serializing once per
+    # item (would be O(n^2) on a 1000-article response). A few rounds absorb the estimate
+    # being off due to uneven article sizes. Ratio-based (not "drop N items computed from
+    # an average item size") so it can never overshoot past zero: max_bytes/total is
+    # always < 1 here (we only loop while total > max_bytes), so target_len is always
+    # strictly less than the current length, guaranteeing convergence without wiping the
+    # list out in one shot.
+    for _ in range(3):
+        if not items or total <= max_bytes:
+            break
+        target_len = max(0, math.floor(len(items) * (max_bytes / total) * 0.9))
+        del items[target_len:]
+        total = _size(result)
+
+    dropped = original_count - len(items)
+    if dropped > 0:
+        result["response_capped"] = {
+            "reason": f"response exceeded the {max_bytes}-byte cap",
+            "kept": len(items),
+            "dropped": dropped,
+            "hint": (
+                "narrow the query (add filters, pass fields=[...] instead of fields=[], "
+                "or reduce page_size) to get more back in one call, or paginate with `page`"
+            ),
+        }
+    return result
+
+
+def _dump_capped(result: dict) -> str:
+    """Serialize a tool's result dict, applying the response-size cap first."""
+    return json.dumps(_cap_response_size(result))
+
+
 def build_source(fields: list[str] | None, clustered: bool) -> str | None:
     """Turn a caller's list of article field names into the News API `_source`
     value: a comma-separated string of dotted paths that trims the response
@@ -614,9 +699,13 @@ async def _search_clustered_across_cutoff(api_token: str, body: dict[str, Any]) 
 
 
 # --- Tools -------------------------------------------------------------------
+# Every tool below returns a pre-serialized JSON string, not a structured object. Without
+# output_schema=None, FastMCP auto-wraps that `str` return into structured_content={"result":
+# <same string>} on every response -- a byte-for-byte duplicate of content[0].text, doubling
+# response size for no benefit. output_schema=None suppresses that.
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def search_articles(
     q: str,
     api_token: str = "",
@@ -962,14 +1051,14 @@ async def search_articles(
             result = await make_api_request(api_token=api_token, path="/api/search", json_data=body)
         if clustered:
             result = _trim_cluster_articles(result, cluster_top_n_articles)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def get_latest_headlines(
     api_token: str = "",
     when: str | None = None,
@@ -1181,14 +1270,14 @@ async def get_latest_headlines(
         result = await make_api_request(api_token=api_token, path="/api/latest_headlines", json_data=body)
         if clustered:
             result = _trim_cluster_articles(result, cluster_top_n_articles)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def get_breaking_news(
     api_token: str = "",
     sort_by: str | None = None,
@@ -1314,14 +1403,14 @@ async def get_breaking_news(
         _add_field(body, "content_sentiment_max", content_sentiment_max)
 
         result = await make_api_request(api_token=api_token, path="/api/breaking_news", json_data=body)
-        return json.dumps(_project_result(result, fields))
+        return _dump_capped(_project_result(result, fields))
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def search_by_author(
     author_name: str,
     api_token: str = "",
@@ -1502,14 +1591,14 @@ async def search_by_author(
         if source is not None:
             body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/authors", json_data=body)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def search_by_link(
     api_token: str = "",
     ids: list[str] | None = None,
@@ -1576,14 +1665,14 @@ async def search_by_link(
         if source is not None:
             body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/search_by_link", json_data=body)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def list_sources(
     api_token: str = "",
     lang: list[str] | None = None,
@@ -1685,14 +1774,14 @@ async def list_sources(
         _add_field(body, "to_rank", to_rank)
 
         result = await make_api_request(api_token=api_token, path="/api/sources", json_data=body)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def get_aggregation_count(
     q: str,
     api_token: str = "",
@@ -1890,14 +1979,14 @@ async def get_aggregation_count(
         _add_field(body, "robots_compliant", robots_compliant)
 
         result = await make_api_request(api_token=api_token, path="/api/aggregation_count", json_data=body)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def get_subscription(api_token: str = "") -> str:
     """
     Check your News API plan, quota, and remaining calls.
@@ -1926,7 +2015,7 @@ async def get_subscription(api_token: str = "") -> str:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def check_health(api_token: str = "") -> str:
     """
     Local liveness ping -- confirms this MCP server process is up and responding.

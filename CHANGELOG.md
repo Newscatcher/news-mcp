@@ -6,6 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.7] — 2026-09-04
+
+### Added
+- Response size cap. A broad query (`fields=[]` -- the documented full-object opt-out --
+  combined with `page_size=1000` and no filters, i.e. "give me all articles") could
+  return an arbitrarily large response, since `page_size`/`fields` only bound article
+  *count*/*width*, never total serialized bytes. `search_articles`,
+  `get_latest_headlines`, `get_breaking_news`, and `search_by_author` now route their
+  final `json.dumps(...)` through a new `_cap_response_size` (`server.py`, next to
+  `_trim_cluster_articles`), which trims trailing entries from whichever of `articles`,
+  `clusters`, or `breaking_news_events` is present (the same three shapes
+  `_project_result` already understands) until the response fits under
+  `MAX_RESPONSE_BYTES` (env-configurable, default 60000).
+  - Structure-aware, not a byte slice: always produces valid, still-parseable JSON.
+    Never touches per-article field content, only how many articles come back.
+  - Ratio-based trim (`target_len = floor(len(items) * max_bytes/total * 0.9)`), not a
+    fixed per-item drop count, so it converges in 1-3 rounds without ever overshooting
+    to zero -- an earlier average-bytes-per-item estimate with a flat +20% margin could
+    compute a drop count larger than the list itself and wipe it out in one shot; fixed
+    before release, covered by `ResponseSizeCapTests.test_trims_flat_articles_and_reports_counts`
+    and friends in `tests/test_server.py`.
+  - No-op (nothing added, nothing changed) both when a response already fits under the
+    cap and when its shape isn't one of the three known ones (`list_sources`,
+    `get_aggregation_count`, `get_subscription`, `check_health`, `search_by_link`) --
+    those are left to the backstop below.
+  - When it trims, the response carries a `response_capped: {reason, kept, dropped,
+    hint}` block explaining what happened and how to get the rest, following the same
+    structured-explanation pattern this codebase already uses for
+    `_search_clustered_across_cutoff`'s `date_range_split`.
+  - FastMCP's built-in `ResponseLimitingMiddleware` (`mcp.add_middleware(...)`, left at
+    its 1MB default) is also registered as a coarse backstop behind this -- it does a
+    byte-blind truncation with no JSON-awareness, so it's a last resort for a shape the
+    structured cap above doesn't know about, not the primary mechanism.
+- `MAX_RESPONSE_BYTES` env var (default `60000`) controls the structured cap's
+  threshold. See README "Response size cap".
+
+### Fixed
+- The `fastmcp`-not-installed test stub in `tests/test_server.py` (`_install_test_stubs`)
+  had two gaps that would break `import server` in an environment without the real
+  `fastmcp` package: its stub `FastMCP.tool()` didn't accept keyword arguments at all
+  (broken since `output_schema=None` was added to every `@mcp.tool()` call in 0.4.6, just
+  not caught until this change exercised the stub path), and it had no stub for
+  `fastmcp.server.middleware.response_limiting.ResponseLimitingMiddleware` or
+  `FastMCP.add_middleware()`, both newly imported/used by this change. Fixed and verified
+  by simulating a missing `fastmcp` package end-to-end.
+
 ## [0.4.6] — 2026-09-03
 
 ### Added
@@ -45,6 +91,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 - Added `posthog==7.39.1` to `requirements.txt`.
+
+### Fixed
+- Every tool response was crossing the wire twice. All 9 tools return a pre-serialized
+  JSON string (`-> str`, built via `json.dumps(...)`), but FastMCP's default
+  `wrap_non_object_output_schema=True` behavior auto-derives an `output_schema` for any
+  non-object return type and, at result time, stuffs that same string into
+  `structuredContent={"result": "<same string>"}` in addition to `content[0].text` — a
+  byte-for-byte duplicate on every response, found via review (an 8,384-char payload was
+  arriving as 17,756 bytes). Fixed by adding `output_schema=None` to all 9 `@mcp.tool()`
+  decorators, which suppresses `structuredContent` entirely; `content[0].text` is
+  unaffected. Verified: `structured_content` is `None` post-fix, confirmed against a live
+  tool call, and the non-integration test suite (58 tests) still passes. No test asserted
+  on `structuredContent`, so nothing else changes. There is no server-wide switch for
+  this — `wrap_non_object_output_schema` isn't exposed by `FastMCP()` or `@mcp.tool()`,
+  so it has to be set per tool.
 
 ## [0.4.5] — 2026-09-02
 
