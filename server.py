@@ -26,7 +26,11 @@ highest priority there.
 from __future__ import annotations
 
 import contextvars
+import hashlib
+import hmac
 import json
+import logging
+import math
 import os
 from typing import Any
 from urllib.parse import parse_qs
@@ -34,7 +38,10 @@ from urllib.parse import parse_qs
 import httpx
 from fastmcp import FastMCP
 from fastmcp.server.http import _current_http_request
+from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddleware
 from starlette.middleware import Middleware as StarletteMiddleware
+
+logger = logging.getLogger("news-mcp")
 
 from validators import (
     AGGREGATION_BY_VALUES,
@@ -72,6 +79,11 @@ _session_api_tokens: dict[str, str] = {}
 
 # API Configuration
 API_BASE_URL = os.getenv("NEWS_API_BASE_URL") or "https://v3-api.newscatcherapi.com"
+
+# Hard cap on a tool response's serialized size (bytes), so a broad query (e.g.
+# fields=[], page_size=1000, no filters) can't return an unbounded payload. See
+# _cap_response_size.
+MAX_RESPONSE_BYTES = int(os.getenv("MAX_RESPONSE_BYTES", "250000"))
 
 
 class ApiTokenASGIMiddleware:
@@ -309,6 +321,13 @@ hand:
 Decide per query, not as a fixed checklist — most requests still just need one well-formed call.""",
 )
 
+# Coarse, last-resort backstop behind _cap_response_size (see below): a byte-blind
+# truncation (not JSON-aware) that should essentially never fire, since the structured
+# cap already keeps every tool that returns articles well under this. Left at its
+# default (1MB) -- it only exists to catch a response shape _cap_response_size doesn't
+# know about (e.g. an unusually large list_sources/get_aggregation_count result).
+mcp.add_middleware(ResponseLimitingMiddleware())
+
 
 def _token_from_session() -> str:
     """Look up the API token for the current MCP session.
@@ -430,6 +449,34 @@ async def make_api_request(api_token: str, path: str, json_data: dict[str, Any] 
             if response.text and response.text.strip():
                 raise ValueError(f"API returned non-JSON response: {response.text[:500]}")
             return {}
+
+
+def _format_unexpected_error(exc: Exception) -> str:
+    """Format a caught exception for a tool's generic (non-ValueError) error path.
+
+    Always includes the exception's type name. Many httpx network errors --
+    ReadTimeout, ConnectTimeout, ConnectError -- stringify to an empty message when
+    raised without an explicit reason, so "Unexpected error: " alone (str(e) empty)
+    gives the caller nothing to act on; the type name at least says it was a timeout
+    vs. a connection error vs. something else.
+    """
+    detail = str(exc)
+    return f"Unexpected error: {type(exc).__name__}" + (f": {detail}" if detail else "")
+
+
+def _default_if_none(value: Any, default: Any) -> Any:
+    """Map an explicit `None` back to `default`, so a caller sending JSON `null` for a
+    parameter behaves exactly like omitting it -- Python only applies a function's own
+    default when the argument is entirely absent, not when it's explicitly passed as
+    None, so `X | None = True`-typed parameters otherwise silently diverge: omitted
+    gets True, explicit null gets None, which _add_field then drops before the request
+    body is built, letting the upstream API's own default win instead of ours.
+
+    Only for parameters where that divergence is unintentional. `fields` and
+    `cluster_top_n_articles` deliberately give `None` its own distinct meaning (full
+    untrimmed objects / uncapped clusters) and must never be routed through this.
+    """
+    return default if value is None else value
 
 
 def _add_field(body: dict[str, Any], key: str, value: Any) -> None:
@@ -557,6 +604,77 @@ def _trim_cluster_articles(result: Any, top_n: int | None) -> Any:
     return result
 
 
+def _cap_response_size(result: Any, max_bytes: int = MAX_RESPONSE_BYTES) -> Any:
+    """Trim a response's top-level list until it serializes under max_bytes.
+
+    Last line of defense against an unbounded payload (e.g. fields=[], page_size=1000,
+    no filters -- "give me all articles"). Recognizes the same three shapes
+    _project_result already knows -- a flat `articles` list, top-level `clusters`,
+    top-level `breaking_news_events` -- and drops trailing entries from whichever one
+    is present. It does not touch per-article field content (that's fields/
+    _project_result's job) or per-cluster article limits (that's
+    _trim_cluster_articles's job); this only fires when those still leave the response
+    too big.
+
+    No-op, result returned unchanged with no key added, when the response is already
+    under max_bytes, or when none of the three shapes are present (list_sources,
+    get_aggregation_count, get_subscription, check_health, search_by_link -- their
+    payload sizes are already bounded by upstream pagination, required filters, or a
+    small fixed shape).
+    """
+    if not isinstance(result, dict):
+        return result
+
+    def _size(value: Any) -> int:
+        return len(json.dumps(value).encode("utf-8"))
+
+    total = _size(result)
+    if total <= max_bytes:
+        return result
+
+    items: list | None = None
+    for key in ("articles", "clusters", "breaking_news_events"):
+        candidate = result.get(key)
+        if isinstance(candidate, list) and candidate:
+            items = candidate
+            break
+    if items is None:
+        return result
+
+    original_count = len(items)
+    # Scale the list length down by the overage ratio rather than re-serializing once per
+    # item (would be O(n^2) on a 1000-article response). A few rounds absorb the estimate
+    # being off due to uneven article sizes. Ratio-based (not "drop N items computed from
+    # an average item size") so it can never overshoot past zero: max_bytes/total is
+    # always < 1 here (we only loop while total > max_bytes), so target_len is always
+    # strictly less than the current length, guaranteeing convergence without wiping the
+    # list out in one shot.
+    for _ in range(3):
+        if not items or total <= max_bytes:
+            break
+        target_len = max(0, math.floor(len(items) * (max_bytes / total) * 0.9))
+        del items[target_len:]
+        total = _size(result)
+
+    dropped = original_count - len(items)
+    if dropped > 0:
+        result["response_capped"] = {
+            "reason": f"response exceeded the {max_bytes}-byte cap",
+            "kept": len(items),
+            "dropped": dropped,
+            "hint": (
+                "narrow the query (add filters, pass fields=[...] instead of fields=[], "
+                "or reduce page_size) to get more back in one call, or paginate with `page`"
+            ),
+        }
+    return result
+
+
+def _dump_capped(result: dict) -> str:
+    """Serialize a tool's result dict, applying the response-size cap first."""
+    return json.dumps(_cap_response_size(result))
+
+
 def build_source(fields: list[str] | None, clustered: bool) -> str | None:
     """Turn a caller's list of article field names into the News API `_source`
     value: a comma-separated string of dotted paths that trims the response
@@ -609,9 +727,13 @@ async def _search_clustered_across_cutoff(api_token: str, body: dict[str, Any]) 
 
 
 # --- Tools -------------------------------------------------------------------
+# Every tool below returns a pre-serialized JSON string, not a structured object. Without
+# output_schema=None, FastMCP auto-wraps that `str` return into structured_content={"result":
+# <same string>} on every response -- a byte-for-byte duplicate of content[0].text, doubling
+# response size for no benefit. output_schema=None suppresses that.
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def search_articles(
     q: str,
     api_token: str = "",
@@ -872,6 +994,13 @@ async def search_articles(
         - 408: query too broad/slow -- narrow the query, date range, or page_size.
         - 429: rate limited -- check get_subscription for your concurrency limit.
     """
+    # An explicit null for these must behave like omitting them (see _default_if_none) --
+    # fields/cluster_top_n_articles are the only parameters where null is intentionally
+    # different from omission, and are deliberately not touched here.
+    clustering_enabled = _default_if_none(clustering_enabled, True)
+    include_nlp_data = _default_if_none(include_nlp_data, True)
+    include_translation_fields = _default_if_none(include_translation_fields, True)
+    exclude_duplicates = _default_if_none(exclude_duplicates, True)
     try:
         lint_query(q)
         validate_search_in(search_in)
@@ -957,14 +1086,14 @@ async def search_articles(
             result = await make_api_request(api_token=api_token, path="/api/search", json_data=body)
         if clustered:
             result = _trim_cluster_articles(result, cluster_top_n_articles)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def get_latest_headlines(
     api_token: str = "",
     when: str | None = None,
@@ -1112,6 +1241,10 @@ async def get_latest_headlines(
         - 403: a requested field/filter isn't included in your plan.
         - 422: invalid parameter combination (e.g. bad `when` format).
     """
+    # See _default_if_none: an explicit null for these must behave like omitting them.
+    clustering_enabled = _default_if_none(clustering_enabled, True)
+    include_nlp_data = _default_if_none(include_nlp_data, True)
+    include_translation_fields = _default_if_none(include_translation_fields, True)
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
         validate_choice(clustering_variable, CLUSTERING_VARIABLE_VALUES, "clustering_variable")
@@ -1176,14 +1309,14 @@ async def get_latest_headlines(
         result = await make_api_request(api_token=api_token, path="/api/latest_headlines", json_data=body)
         if clustered:
             result = _trim_cluster_articles(result, cluster_top_n_articles)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def get_breaking_news(
     api_token: str = "",
     sort_by: str | None = None,
@@ -1276,6 +1409,9 @@ async def get_breaking_news(
         - 403: a requested field/filter isn't included in your plan.
         - 422: top_n_articles * page_size exceeds 1000, or other invalid params.
     """
+    # See _default_if_none: an explicit null for these must behave like omitting them.
+    include_nlp_data = _default_if_none(include_nlp_data, True)
+    include_translation_fields = _default_if_none(include_translation_fields, True)
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
         validate_fields(fields)
@@ -1309,14 +1445,14 @@ async def get_breaking_news(
         _add_field(body, "content_sentiment_max", content_sentiment_max)
 
         result = await make_api_request(api_token=api_token, path="/api/breaking_news", json_data=body)
-        return json.dumps(_project_result(result, fields))
+        return _dump_capped(_project_result(result, fields))
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def search_by_author(
     author_name: str,
     api_token: str = "",
@@ -1439,6 +1575,9 @@ async def search_by_author(
         - 403: a requested field/filter isn't included in your plan.
         - 422: invalid parameter combination.
     """
+    # See _default_if_none: an explicit null for these must behave like omitting them.
+    include_nlp_data = _default_if_none(include_nlp_data, True)
+    include_translation_fields = _default_if_none(include_translation_fields, True)
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
         validate_fields(fields)
@@ -1497,14 +1636,14 @@ async def search_by_author(
         if source is not None:
             body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/authors", json_data=body)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def search_by_link(
     api_token: str = "",
     ids: list[str] | None = None,
@@ -1571,14 +1710,14 @@ async def search_by_link(
         if source is not None:
             body["_source"] = source
         result = await make_api_request(api_token=api_token, path="/api/search_by_link", json_data=body)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def list_sources(
     api_token: str = "",
     lang: list[str] | None = None,
@@ -1680,14 +1819,14 @@ async def list_sources(
         _add_field(body, "to_rank", to_rank)
 
         result = await make_api_request(api_token=api_token, path="/api/sources", json_data=body)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def get_aggregation_count(
     q: str,
     api_token: str = "",
@@ -1885,14 +2024,14 @@ async def get_aggregation_count(
         _add_field(body, "robots_compliant", robots_compliant)
 
         result = await make_api_request(api_token=api_token, path="/api/aggregation_count", json_data=body)
-        return json.dumps(result)
+        return _dump_capped(result)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def get_subscription(api_token: str = "") -> str:
     """
     Check your News API plan, quota, and remaining calls.
@@ -1918,10 +2057,10 @@ async def get_subscription(api_token: str = "") -> str:
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
-@mcp.tool()
+@mcp.tool(output_schema=None)
 async def check_health(api_token: str = "") -> str:
     """
     Local liveness ping -- confirms this MCP server process is up and responding.
@@ -1941,6 +2080,131 @@ async def check_health(api_token: str = "") -> str:
     return json.dumps({"status": "ok", "server": "news-mcp"}, indent=2)
 
 
+def _identity_salt() -> str | None:
+    """HMAC key for pseudonymous analytics ids, if one is configured."""
+    raw = os.getenv("POSTHOG_IDENTITY_SALT")
+    return raw.strip() if raw and raw.strip() else None
+
+
+def _identity_digest(value: str, salt: str) -> str:
+    """Derive a stable, non-reversible analytics id from a caller's API token."""
+    digest = hmac.new(salt.encode("utf-8"), value.encode("utf-8"), hashlib.sha256)
+    return f"key_{digest.hexdigest()[:16]}"
+
+
+async def _analytics_identity(request: dict[str, Any], extra: dict[str, Any] | None = None) -> Any:
+    """Resolve who is calling, for PostHog's ``identify`` hook.
+
+    Every tool except `check_health` requires an API token, so identity is always
+    keyed: an HMAC of the caller's token. The raw token is never sent to PostHog.
+    `POSTHOG_IDENTITY_SALT` is optional here -- API tokens are high-entropy enough
+    to not need a salt to be unguessable -- but set one if you want the digest to
+    change if a token is ever rotated in a predictable way.
+
+    A `check_health` call (or any call with no resolvable token) leaves the
+    session anonymous rather than attributed.
+    """
+    from posthog.mcp import UserIdentity
+
+    token = _token_from_session()
+    if not token:
+        return None
+    return UserIdentity(
+        distinct_id=_identity_digest(token, _identity_salt() or ""),
+        properties={"auth": "keyed"},
+    )
+
+
+# --- PostHog MCP analytics ----------------------------------------------------------------
+# Optional and self-disabling: with no POSTHOG_PROJECT_API_KEY the server behaves exactly as
+# it did before. instrument() captures one $mcp_tool_call per invocation (tool name,
+# parameters, response, duration, error flag), plus $mcp_initialize, $mcp_tools_list and
+# $exception, sent to the PostHog project named by the key.
+#
+# NOT wired via `npx @posthog/wizard mcp-analytics` -- that wizard only instruments
+# TypeScript/JavaScript servers built on `@modelcontextprotocol/sdk`. This is a Python
+# `fastmcp` server, so it uses the `posthog.mcp` module directly instead.
+#
+# instrument() MUST run before the ASGI app is built and before mcp.http_app is
+# monkey-patched below: it wraps FastMCP's app factories to install PostHog's
+# stateless-session middleware, which mints the Mcp-Session-Id token that stitches
+# $session_id and client identity together across requests. Running it after either of
+# those would silently lose that wrapping.
+POSTHOG_HOST = os.getenv("POSTHOG_HOST", "https://us.i.posthog.com")
+
+
+def _init_analytics() -> Any | None:
+    """Instrument ``mcp`` for PostHog MCP analytics when a project key is configured.
+
+    Returns:
+        Any | None: The PostHog client to flush per request, or None when analytics
+            are disabled or could not be wired up.
+    """
+    key = os.getenv("POSTHOG_PROJECT_API_KEY", "").strip()
+    if not key:
+        logger.info("PostHog MCP analytics disabled: POSTHOG_PROJECT_API_KEY is not set")
+        return None
+    try:
+        from posthog import Client
+        from posthog.mcp import MCPAnalyticsOptions, instrument
+
+        client = Client(key, host=POSTHOG_HOST)
+        instrument(
+            mcp,
+            client,
+            MCPAnalyticsOptions(
+                # Analytics observes; it never shapes the tool contract. Each of these
+                # would otherwise change what callers see:
+                #   context                -> injects a `context` argument into every tool
+                #                             (defaults to True upstream)
+                #   enable_conversation_id -> injects a `conversation_id` argument
+                #   report_missing         -> advertises an extra virtual `get_more_tools` tool
+                # Pinned explicitly so an SDK release can't silently start editing our schema.
+                context=False,
+                enable_conversation_id=False,
+                report_missing=False,
+                identify=_analytics_identity,
+            ),
+        )
+    except Exception as exc:
+        # Analytics must never take the server down.
+        logger.warning("PostHog MCP analytics could not be initialized; serving without it: %s", exc)
+        return None
+    logger.info(
+        "PostHog MCP analytics enabled (host=%s, salted_identity=%s)",
+        POSTHOG_HOST,
+        bool(_identity_salt()),
+    )
+    return client
+
+
+_posthog_client = _init_analytics()
+
+
+class _AnalyticsFlushMiddleware:
+    """Flush queued analytics events at the end of each HTTP request.
+
+    The PostHog client batches events on a background thread, but a hosted/serverless
+    instance can be frozen or recycled right after its response is sent, dropping
+    whatever is still queued. Flushing here costs the caller nothing extra and makes
+    delivery deterministic.
+    """
+
+    def __init__(self, app: Any, client: Any) -> None:
+        self.app = app
+        self.client = client
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if scope.get("type") == "http":
+                try:
+                    self.client.flush()
+                except Exception as exc:
+                    logger.warning("PostHog event flush failed: %s", exc)
+
+
 # Patch mcp.http_app to always inject ApiTokenASGIMiddleware, regardless of how the
 # server is invoked (uvicorn server:app, fastmcp run server.py:mcp, python server.py, etc.)
 _original_http_app = mcp.http_app
@@ -1957,6 +2221,8 @@ mcp.http_app = _http_app_with_api_token_middleware  # type: ignore[method-assign
 
 # Module-level ASGI app for deployment via `uvicorn server:app`
 app = mcp.http_app()
+if _posthog_client is not None:
+    app.add_middleware(_AnalyticsFlushMiddleware, client=_posthog_client)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,152 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.8] — 2026-09-04
+
+### Fixed
+- `clustering_enabled`, `include_nlp_data`, `include_translation_fields`, and
+  `exclude_duplicates` diverged between "omitted" and "explicit `null`", even though both
+  are supposed to mean "no opinion, use the default." Every one of these is typed
+  `bool | None = True` -- Python only applies that `True` default when the argument is
+  entirely absent, so an explicit JSON `null` (schema-valid, since the type allows it)
+  bypassed the default, fell through to `None`, and was then dropped by `_add_field`
+  before the upstream request was built -- letting the *News API's own* default win
+  instead of ours. Confirmed live against prod on `search_articles`: `null` flipped the
+  response shape (`clusters` → flat `articles` list), dropped the `nlp` block entirely,
+  and skipped near-duplicate suppression, none of which is what a caller sending "no
+  value" for these would expect.
+  - `clustering_enabled`'s divergence compounded further: this function separately reads
+    `clustered = body.get("clustering_enabled") is True` to decide `build_source`'s
+    `_source` prefix and whether to run `_trim_cluster_articles` -- with the key dropped,
+    that read `None is True` → `False`, so `null` also picked the wrong (flat)
+    `_source` prefix client-side even when the API itself still clustered by its own
+    default.
+  - Fixed with a new `_default_if_none(value, default)` helper (`server.py`, next to
+    `_add_field`) and one guard line per affected parameter at the top of each of the 4
+    tools that have any of them (`search_articles`: all 4; `get_latest_headlines`:
+    `clustering_enabled`, `include_nlp_data`, `include_translation_fields`;
+    `get_breaking_news` and `search_by_author`: `include_nlp_data`,
+    `include_translation_fields`) -- 11 (tool, parameter) pairs total. Placed before any
+    other code in the function, so both the request-body build and
+    `clustering_enabled`'s later `body.get(...)` re-read see the normalized value.
+  - **`fields` and `cluster_top_n_articles` are deliberately excluded and unchanged.**
+    Both already give explicit `null` its own distinct, correctly-documented meaning
+    (full untrimmed objects / uncapped clusters) — that is intentional, not this bug, and
+    stays exactly as-is.
+  - Scope was originally reported as "18 parameters across 5 tools"; an exhaustive
+    enumeration of all 9 tools found the actual unintentional-divergence set is smaller:
+    11 pairs / 4 parameter names / 4 tools. The larger figure counted `fields` (5 tools)
+    and `cluster_top_n_articles` (2 tools) as bugs alongside the 11 genuine ones — correct
+    once those two intentional exceptions are excluded.
+  - No existing test asserted the old (buggy) behavior; new regression tests added in
+    `tests/test_server.py` cover all 4 tools' `None` inputs producing the same request
+    body as omission (including the `clustering_enabled`/`_source`-prefix compounding
+    case), plus a guard confirming `fields=None`/`cluster_top_n_articles=None` are
+    unaffected.
+
+## [0.4.7] — 2026-09-04
+
+### Added
+- Response size cap. A broad query (`fields=[]` -- the documented full-object opt-out --
+  combined with `page_size=1000` and no filters, i.e. "give me all articles") could
+  return an arbitrarily large response, since `page_size`/`fields` only bound article
+  *count*/*width*, never total serialized bytes. `search_articles`,
+  `get_latest_headlines`, `get_breaking_news`, and `search_by_author` now route their
+  final `json.dumps(...)` through a new `_cap_response_size` (`server.py`, next to
+  `_trim_cluster_articles`), which trims trailing entries from whichever of `articles`,
+  `clusters`, or `breaking_news_events` is present (the same three shapes
+  `_project_result` already understands) until the response fits under
+  `MAX_RESPONSE_BYTES` (env-configurable, default 250000).
+  - Structure-aware, not a byte slice: always produces valid, still-parseable JSON.
+    Never touches per-article field content, only how many articles come back.
+  - Ratio-based trim (`target_len = floor(len(items) * max_bytes/total * 0.9)`), not a
+    fixed per-item drop count, so it converges in 1-3 rounds without ever overshooting
+    to zero -- an earlier average-bytes-per-item estimate with a flat +20% margin could
+    compute a drop count larger than the list itself and wipe it out in one shot; fixed
+    before release, covered by `ResponseSizeCapTests.test_trims_flat_articles_and_reports_counts`
+    and friends in `tests/test_server.py`.
+  - No-op (nothing added, nothing changed) both when a response already fits under the
+    cap and when its shape isn't one of the three known ones (`list_sources`,
+    `get_aggregation_count`, `get_subscription`, `check_health`, `search_by_link`) --
+    those are left to the backstop below.
+  - When it trims, the response carries a `response_capped: {reason, kept, dropped,
+    hint}` block explaining what happened and how to get the rest, following the same
+    structured-explanation pattern this codebase already uses for
+    `_search_clustered_across_cutoff`'s `date_range_split`.
+  - FastMCP's built-in `ResponseLimitingMiddleware` (`mcp.add_middleware(...)`, left at
+    its 1MB default) is also registered as a coarse backstop behind this -- it does a
+    byte-blind truncation with no JSON-awareness, so it's a last resort for a shape the
+    structured cap above doesn't know about, not the primary mechanism.
+- `MAX_RESPONSE_BYTES` env var (default `250000`, ~60k tokens) controls the structured
+  cap's threshold -- sized as a safety net against an unbounded "give me all articles"
+  response, not to fill a large model's context window; raise it via the env var if a
+  deployment wants more headroom. See README "Response size cap".
+
+### Fixed
+- The `fastmcp`-not-installed test stub in `tests/test_server.py` (`_install_test_stubs`)
+  had two gaps that would break `import server` in an environment without the real
+  `fastmcp` package: its stub `FastMCP.tool()` didn't accept keyword arguments at all
+  (broken since `output_schema=None` was added to every `@mcp.tool()` call in 0.4.6, just
+  not caught until this change exercised the stub path), and it had no stub for
+  `fastmcp.server.middleware.response_limiting.ResponseLimitingMiddleware` or
+  `FastMCP.add_middleware()`, both newly imported/used by this change. Fixed and verified
+  by simulating a missing `fastmcp` package end-to-end.
+
+## [0.4.6] — 2026-09-03
+
+### Added
+- PostHog MCP Analytics. `posthog.mcp.instrument()` wraps the server, so every
+  invocation lands as one `$mcp_tool_call` (tool name, parameters, response, duration,
+  error flag) alongside `$mcp_initialize`, `$mcp_tools_list` and `$exception`. Events go
+  to the PostHog project named by `POSTHOG_PROJECT_API_KEY`; `POSTHOG_HOST` picks the
+  region (defaults to `https://us.i.posthog.com`). See README "Analytics (optional)".
+  - **Off by default.** No key, no analytics, no behaviour change — and any failure
+    while wiring it up is logged and swallowed rather than taking the server down.
+  - **Observation only.** `context`, `enable_conversation_id`, and `report_missing` are
+    pinned off in `MCPAnalyticsOptions`, since each would otherwise inject an argument
+    or an extra tool into the schema callers see (`context` defaults to `True`
+    upstream). `tools/list` is unchanged with analytics on or off.
+  - `instrument()` runs before `mcp.http_app` is monkey-patched (for
+    `ApiTokenASGIMiddleware`) and before `app = mcp.http_app()` builds the ASGI app — it
+    wraps FastMCP's app factories to install PostHog's stateless-session middleware,
+    which mints the `Mcp-Session-Id` token that stitches `$session_id` and identity
+    together across requests. Verified both middlewares end up on the built app in the
+    right order.
+  - A small ASGI middleware (`_AnalyticsFlushMiddleware`) flushes the client at the end
+    of each HTTP request, since PostHog's client batches on a background thread that a
+    frozen/recycled server instance may never get to run again.
+  - Callers are attributed pseudonymously by API token, since every tool but
+    `check_health` requires one: `distinct_id` is an HMAC of the token
+    (`auth: keyed`), optionally salted by `POSTHOG_IDENTITY_SALT`. The raw token is
+    never sent. A call with no resolvable token stays anonymous rather than
+    attributed. No client-IP fallback — this server is only ever called with a
+    token, so there is no meaningful keyless caller to identify by IP.
+  - Credentials are not captured: the SDK redacts any argument whose key looks like an
+    api key or token before the event leaves the process.
+  - **Not** wired via `npx @posthog/wizard mcp-analytics` — that wizard's OAuth
+    login/codegen flow only targets TypeScript/JavaScript servers built on
+    `@modelcontextprotocol/sdk`, and does nothing useful against this Python `fastmcp`
+    server. The `posthog.mcp` module is the Python path instead; no login step, just a
+    static Project API key.
+
+### Changed
+- Added `posthog==7.39.1` to `requirements.txt`.
+
+### Fixed
+- Every tool response was crossing the wire twice. All 9 tools return a pre-serialized
+  JSON string (`-> str`, built via `json.dumps(...)`), but FastMCP's default
+  `wrap_non_object_output_schema=True` behavior auto-derives an `output_schema` for any
+  non-object return type and, at result time, stuffs that same string into
+  `structuredContent={"result": "<same string>"}` in addition to `content[0].text` — a
+  byte-for-byte duplicate on every response, found via review (an 8,384-char payload was
+  arriving as 17,756 bytes). Fixed by adding `output_schema=None` to all 9 `@mcp.tool()`
+  decorators, which suppresses `structuredContent` entirely; `content[0].text` is
+  unaffected. Verified: `structured_content` is `None` post-fix, confirmed against a live
+  tool call, and the non-integration test suite (58 tests) still passes. No test asserted
+  on `structuredContent`, so nothing else changes. There is no server-wide switch for
+  this — `wrap_non_object_output_schema` isn't exposed by `FastMCP()` or `@mcp.tool()`,
+  so it has to be set per tool.
+
 ## [0.4.5] — 2026-09-02
 
 ### Fixed

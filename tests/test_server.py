@@ -31,7 +31,7 @@ def _install_test_stubs() -> None:
             def __init__(self, *args, **kwargs):
                 pass
 
-            def tool(self):
+            def tool(self, *args, **kwargs):
                 def decorator(func):
                     return func
 
@@ -39,6 +39,9 @@ def _install_test_stubs() -> None:
 
             def http_app(self, *args, **kwargs):
                 return None
+
+            def add_middleware(self, *args, **kwargs):
+                pass
 
             def run(self, *args, **kwargs):
                 pass
@@ -49,9 +52,20 @@ def _install_test_stubs() -> None:
 
         fastmcp_module.FastMCP = FastMCP
 
+        middleware_module = types.ModuleType("fastmcp.server.middleware")
+        response_limiting_module = types.ModuleType("fastmcp.server.middleware.response_limiting")
+
+        class ResponseLimitingMiddleware:  # pragma: no cover - only used in fallback envs
+            def __init__(self, *args, **kwargs):
+                pass
+
+        response_limiting_module.ResponseLimitingMiddleware = ResponseLimitingMiddleware
+
         sys.modules["fastmcp"] = fastmcp_module
         sys.modules["fastmcp.server"] = server_module
         sys.modules["fastmcp.server.http"] = http_module
+        sys.modules["fastmcp.server.middleware"] = middleware_module
+        sys.modules["fastmcp.server.middleware.response_limiting"] = response_limiting_module
 
     try:
         import starlette.middleware  # noqa: F401
@@ -755,6 +769,87 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(called["include_nlp_data"], False)
         self.assertEqual(called["exclude_duplicates"], False)
 
+    async def test_none_normalizes_to_default_for_search_articles(self) -> None:
+        """Regression: explicit null for these 4 params must behave exactly like
+        omitting them, not like the upstream API's own default. Confirmed live
+        against prod that null silently bypassed the True default via _add_field
+        before this fix -- clustering_enabled=null flipped the response shape
+        (clusters -> flat list) and include_nlp_data=null dropped the nlp block
+        entirely, even though the caller's intent ("no opinion") was the same as
+        omitting the parameter."""
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.search_articles)(
+                q="ai",
+                clustering_enabled=None,
+                include_nlp_data=None,
+                include_translation_fields=None,
+                exclude_duplicates=None,
+            )
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["clustering_enabled"], True)
+        self.assertEqual(called["include_nlp_data"], True)
+        self.assertEqual(called["include_translation_fields"], True)
+        self.assertEqual(called["exclude_duplicates"], True)
+        # clustering_enabled=None must also still take the clustered client-side path
+        # (correct build_source prefix) -- before the fix, _add_field dropped the key,
+        # so the later `body.get("clustering_enabled") is True` re-read False, and this
+        # picked the wrong (flat) _source prefix even though the API itself still
+        # clustered by its own default.
+        self.assertEqual(
+            called["_source"],
+            server.build_source(validators.DEFAULT_ARTICLE_FIELDS, clustered=True),
+        )
+
+    async def test_none_normalizes_to_default_for_get_latest_headlines(self) -> None:
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.get_latest_headlines)(
+                clustering_enabled=None, include_nlp_data=None, include_translation_fields=None
+            )
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["clustering_enabled"], True)
+        self.assertEqual(called["include_nlp_data"], True)
+        self.assertEqual(called["include_translation_fields"], True)
+
+    async def test_none_normalizes_to_default_for_get_breaking_news(self) -> None:
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.get_breaking_news)(include_nlp_data=None, include_translation_fields=None)
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["include_nlp_data"], True)
+        self.assertEqual(called["include_translation_fields"], True)
+
+    async def test_none_normalizes_to_default_for_search_by_author(self) -> None:
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.search_by_author)(
+                author_name="Jane Doe", include_nlp_data=None, include_translation_fields=None
+            )
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["include_nlp_data"], True)
+        self.assertEqual(called["include_translation_fields"], True)
+
+    async def test_fields_and_cluster_top_n_articles_null_semantics_unchanged(self) -> None:
+        """Regression guard for the two intentional exceptions this fix must not touch:
+        fields=None and cluster_top_n_articles=None keep their documented,
+        different-from-omission meaning (full untrimmed objects / uncapped clusters)."""
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.search_articles)(q="ai", fields=None)
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertNotIn("_source", called)  # still means "full objects", not the lean default
+
+        raw = {
+            "clusters_count": 1,
+            "clusters": [{"cluster_id": "c1", "cluster_size": 5, "articles": [{"title": f"a{i}"} for i in range(5)]}],
+        }
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = raw
+            result = await _unwrap(server.search_articles)(q="ai", cluster_top_n_articles=None)
+        data = json.loads(result)
+        self.assertEqual(len(data["clusters"][0]["articles"]), 5)  # still uncapped
+
     async def test_get_aggregation_count_does_not_default_include_nlp_data(self) -> None:
         """Unlike the article-returning tools, get_aggregation_count returns no
         articles, so include_nlp_data is left as None/omitted rather than True."""
@@ -953,6 +1048,71 @@ class ClusteringStraddleTests(unittest.TestCase):
 
     def test_missing_dates_false(self) -> None:
         self.assertFalse(validators.clustering_straddles_cutoff(None, None))
+
+
+class ResponseSizeCapTests(unittest.TestCase):
+    """_cap_response_size is the last-resort trim for an unbounded response (e.g.
+    fields=[], page_size=1000, no filters -- "give me all articles"). It must produce
+    still-valid JSON (never a mid-object byte slice), never touch per-article field
+    content, and no-op both when the response already fits and when the shape isn't
+    one of the three it knows how to trim."""
+
+    def test_noop_under_budget(self) -> None:
+        r = {"articles": [{"title": "t"}]}
+        out = server._cap_response_size(dict(r), max_bytes=100_000)
+        self.assertEqual(out, r)
+        self.assertNotIn("response_capped", out)
+
+    def test_trims_flat_articles_and_reports_counts(self) -> None:
+        articles = [{"title": "x" * 200, "link": f"https://example.com/{i}"} for i in range(300)]
+        r = {"total_hits": 300, "articles": articles}
+        out = server._cap_response_size(dict(r), max_bytes=10_000)
+
+        self.assertLessEqual(len(json.dumps(out).encode("utf-8")), 10_000 + 1_000)
+        self.assertIn("response_capped", out)
+        kept, dropped = out["response_capped"]["kept"], out["response_capped"]["dropped"]
+        self.assertEqual(kept + dropped, 300)
+        self.assertEqual(kept, len(out["articles"]))
+        self.assertGreater(dropped, 0)
+        # Field content of surviving articles is untouched -- this only drops trailing
+        # entries, it never trims field width (that's _project_result's job).
+        self.assertEqual(out["articles"][0], articles[0])
+        # Always valid, parseable JSON.
+        json.loads(json.dumps(out))
+
+    def test_trims_top_level_clusters(self) -> None:
+        clusters = [
+            {"cluster_id": i, "cluster_size": 3, "articles": [{"title": "y" * 150}] * 3}
+            for i in range(150)
+        ]
+        r = {"clusters_count": 150, "clusters": clusters}
+        out = server._cap_response_size(dict(r), max_bytes=10_000)
+
+        self.assertLessEqual(len(json.dumps(out).encode("utf-8")), 10_000 + 1_000)
+        self.assertLess(len(out["clusters"]), 150)
+        self.assertEqual(out["response_capped"]["kept"], len(out["clusters"]))
+
+    def test_trims_breaking_news_events(self) -> None:
+        events = [{"event_id": i, "articles": [{"title": "z" * 150}] * 2} for i in range(150)]
+        r = {"breaking_news_events": events}
+        out = server._cap_response_size(dict(r), max_bytes=10_000)
+
+        self.assertLessEqual(len(json.dumps(out).encode("utf-8")), 10_000 + 1_000)
+        self.assertLess(len(out["breaking_news_events"]), 150)
+
+    def test_noop_for_unrecognized_shape(self) -> None:
+        # list_sources' `sources` list (and similar upstream-only shapes) aren't one of
+        # the three known keys -- left to the ResponseLimitingMiddleware backstop.
+        r = {"sources": [{"name": "x" * 500}] * 200}
+        out = server._cap_response_size(dict(r), max_bytes=100)
+        self.assertNotIn("response_capped", out)
+        self.assertEqual(len(out["sources"]), 200)
+
+    def test_single_oversized_item_does_not_crash(self) -> None:
+        r = {"articles": [{"title": "q" * 50_000}]}
+        out = server._cap_response_size(dict(r), max_bytes=1_000)
+        json.loads(json.dumps(out))  # must still be valid JSON even when nothing fits
+        self.assertEqual(out["response_capped"]["kept"], len(out["articles"]))
 
 
 if __name__ == "__main__":
