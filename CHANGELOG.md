@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.8] — 2026-09-04
+
+### Fixed
+- `clustering_enabled`, `include_nlp_data`, `include_translation_fields`, and
+  `exclude_duplicates` diverged between "omitted" and "explicit `null`", even though both
+  are supposed to mean "no opinion, use the default." Every one of these is typed
+  `bool | None = True` -- Python only applies that `True` default when the argument is
+  entirely absent, so an explicit JSON `null` (schema-valid, since the type allows it)
+  bypassed the default, fell through to `None`, and was then dropped by `_add_field`
+  before the upstream request was built -- letting the *News API's own* default win
+  instead of ours. Confirmed live against prod on `search_articles`: `null` flipped the
+  response shape (`clusters` → flat `articles` list), dropped the `nlp` block entirely,
+  and skipped near-duplicate suppression, none of which is what a caller sending "no
+  value" for these would expect.
+  - `clustering_enabled`'s divergence compounded further: this function separately reads
+    `clustered = body.get("clustering_enabled") is True` to decide `build_source`'s
+    `_source` prefix and whether to run `_trim_cluster_articles` -- with the key dropped,
+    that read `None is True` → `False`, so `null` also picked the wrong (flat)
+    `_source` prefix client-side even when the API itself still clustered by its own
+    default.
+  - Fixed with a new `_default_if_none(value, default)` helper (`server.py`, next to
+    `_add_field`) and one guard line per affected parameter at the top of each of the 4
+    tools that have any of them (`search_articles`: all 4; `get_latest_headlines`:
+    `clustering_enabled`, `include_nlp_data`, `include_translation_fields`;
+    `get_breaking_news` and `search_by_author`: `include_nlp_data`,
+    `include_translation_fields`) -- 11 (tool, parameter) pairs total. Placed before any
+    other code in the function, so both the request-body build and
+    `clustering_enabled`'s later `body.get(...)` re-read see the normalized value.
+  - **`fields` and `cluster_top_n_articles` are deliberately excluded and unchanged.**
+    Both already give explicit `null` its own distinct, correctly-documented meaning
+    (full untrimmed objects / uncapped clusters) — that is intentional, not this bug, and
+    stays exactly as-is.
+  - Scope was originally reported as "18 parameters across 5 tools"; an exhaustive
+    enumeration of all 9 tools found the actual unintentional-divergence set is smaller:
+    11 pairs / 4 parameter names / 4 tools. The larger figure counted `fields` (5 tools)
+    and `cluster_top_n_articles` (2 tools) as bugs alongside the 11 genuine ones — correct
+    once those two intentional exceptions are excluded.
+  - No existing test asserted the old (buggy) behavior; new regression tests added in
+    `tests/test_server.py` cover all 4 tools' `None` inputs producing the same request
+    body as omission (including the `clustering_enabled`/`_source`-prefix compounding
+    case), plus a guard confirming `fields=None`/`cluster_top_n_articles=None` are
+    unaffected.
+
 ## [0.4.7] — 2026-09-04
 
 ### Added

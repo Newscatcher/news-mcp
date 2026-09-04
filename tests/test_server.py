@@ -769,6 +769,87 @@ class ToolBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(called["include_nlp_data"], False)
         self.assertEqual(called["exclude_duplicates"], False)
 
+    async def test_none_normalizes_to_default_for_search_articles(self) -> None:
+        """Regression: explicit null for these 4 params must behave exactly like
+        omitting them, not like the upstream API's own default. Confirmed live
+        against prod that null silently bypassed the True default via _add_field
+        before this fix -- clustering_enabled=null flipped the response shape
+        (clusters -> flat list) and include_nlp_data=null dropped the nlp block
+        entirely, even though the caller's intent ("no opinion") was the same as
+        omitting the parameter."""
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.search_articles)(
+                q="ai",
+                clustering_enabled=None,
+                include_nlp_data=None,
+                include_translation_fields=None,
+                exclude_duplicates=None,
+            )
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["clustering_enabled"], True)
+        self.assertEqual(called["include_nlp_data"], True)
+        self.assertEqual(called["include_translation_fields"], True)
+        self.assertEqual(called["exclude_duplicates"], True)
+        # clustering_enabled=None must also still take the clustered client-side path
+        # (correct build_source prefix) -- before the fix, _add_field dropped the key,
+        # so the later `body.get("clustering_enabled") is True` re-read False, and this
+        # picked the wrong (flat) _source prefix even though the API itself still
+        # clustered by its own default.
+        self.assertEqual(
+            called["_source"],
+            server.build_source(validators.DEFAULT_ARTICLE_FIELDS, clustered=True),
+        )
+
+    async def test_none_normalizes_to_default_for_get_latest_headlines(self) -> None:
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.get_latest_headlines)(
+                clustering_enabled=None, include_nlp_data=None, include_translation_fields=None
+            )
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["clustering_enabled"], True)
+        self.assertEqual(called["include_nlp_data"], True)
+        self.assertEqual(called["include_translation_fields"], True)
+
+    async def test_none_normalizes_to_default_for_get_breaking_news(self) -> None:
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.get_breaking_news)(include_nlp_data=None, include_translation_fields=None)
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["include_nlp_data"], True)
+        self.assertEqual(called["include_translation_fields"], True)
+
+    async def test_none_normalizes_to_default_for_search_by_author(self) -> None:
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.search_by_author)(
+                author_name="Jane Doe", include_nlp_data=None, include_translation_fields=None
+            )
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertEqual(called["include_nlp_data"], True)
+        self.assertEqual(called["include_translation_fields"], True)
+
+    async def test_fields_and_cluster_top_n_articles_null_semantics_unchanged(self) -> None:
+        """Regression guard for the two intentional exceptions this fix must not touch:
+        fields=None and cluster_top_n_articles=None keep their documented,
+        different-from-omission meaning (full untrimmed objects / uncapped clusters)."""
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"ok": True}
+            await _unwrap(server.search_articles)(q="ai", fields=None)
+        called = mock_api.await_args.kwargs["json_data"]
+        self.assertNotIn("_source", called)  # still means "full objects", not the lean default
+
+        raw = {
+            "clusters_count": 1,
+            "clusters": [{"cluster_id": "c1", "cluster_size": 5, "articles": [{"title": f"a{i}"} for i in range(5)]}],
+        }
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = raw
+            result = await _unwrap(server.search_articles)(q="ai", cluster_top_n_articles=None)
+        data = json.loads(result)
+        self.assertEqual(len(data["clusters"][0]["articles"]), 5)  # still uncapped
+
     async def test_get_aggregation_count_does_not_default_include_nlp_data(self) -> None:
         """Unlike the article-returning tools, get_aggregation_count returns no
         articles, so include_nlp_data is left as None/omitted rather than True."""

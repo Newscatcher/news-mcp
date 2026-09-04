@@ -451,6 +451,21 @@ async def make_api_request(api_token: str, path: str, json_data: dict[str, Any] 
             return {}
 
 
+def _default_if_none(value: Any, default: Any) -> Any:
+    """Map an explicit `None` back to `default`, so a caller sending JSON `null` for a
+    parameter behaves exactly like omitting it -- Python only applies a function's own
+    default when the argument is entirely absent, not when it's explicitly passed as
+    None, so `X | None = True`-typed parameters otherwise silently diverge: omitted
+    gets True, explicit null gets None, which _add_field then drops before the request
+    body is built, letting the upstream API's own default win instead of ours.
+
+    Only for parameters where that divergence is unintentional. `fields` and
+    `cluster_top_n_articles` deliberately give `None` its own distinct meaning (full
+    untrimmed objects / uncapped clusters) and must never be routed through this.
+    """
+    return default if value is None else value
+
+
 def _add_field(body: dict[str, Any], key: str, value: Any) -> None:
     """Set body[key] = value if value was actually provided (not None).
 
@@ -966,6 +981,13 @@ async def search_articles(
         - 408: query too broad/slow -- narrow the query, date range, or page_size.
         - 429: rate limited -- check get_subscription for your concurrency limit.
     """
+    # An explicit null for these must behave like omitting them (see _default_if_none) --
+    # fields/cluster_top_n_articles are the only parameters where null is intentionally
+    # different from omission, and are deliberately not touched here.
+    clustering_enabled = _default_if_none(clustering_enabled, True)
+    include_nlp_data = _default_if_none(include_nlp_data, True)
+    include_translation_fields = _default_if_none(include_translation_fields, True)
+    exclude_duplicates = _default_if_none(exclude_duplicates, True)
     try:
         lint_query(q)
         validate_search_in(search_in)
@@ -1206,6 +1228,10 @@ async def get_latest_headlines(
         - 403: a requested field/filter isn't included in your plan.
         - 422: invalid parameter combination (e.g. bad `when` format).
     """
+    # See _default_if_none: an explicit null for these must behave like omitting them.
+    clustering_enabled = _default_if_none(clustering_enabled, True)
+    include_nlp_data = _default_if_none(include_nlp_data, True)
+    include_translation_fields = _default_if_none(include_translation_fields, True)
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
         validate_choice(clustering_variable, CLUSTERING_VARIABLE_VALUES, "clustering_variable")
@@ -1370,6 +1396,9 @@ async def get_breaking_news(
         - 403: a requested field/filter isn't included in your plan.
         - 422: top_n_articles * page_size exceeds 1000, or other invalid params.
     """
+    # See _default_if_none: an explicit null for these must behave like omitting them.
+    include_nlp_data = _default_if_none(include_nlp_data, True)
+    include_translation_fields = _default_if_none(include_translation_fields, True)
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
         validate_fields(fields)
@@ -1533,6 +1562,9 @@ async def search_by_author(
         - 403: a requested field/filter isn't included in your plan.
         - 422: invalid parameter combination.
     """
+    # See _default_if_none: an explicit null for these must behave like omitting them.
+    include_nlp_data = _default_if_none(include_nlp_data, True)
+    include_translation_fields = _default_if_none(include_translation_fields, True)
     try:
         validate_choice(sort_by, SORT_BY_VALUES, "sort_by")
         validate_fields(fields)
