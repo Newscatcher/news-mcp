@@ -451,6 +451,19 @@ async def make_api_request(api_token: str, path: str, json_data: dict[str, Any] 
             return {}
 
 
+def _format_unexpected_error(exc: Exception) -> str:
+    """Format a caught exception for a tool's generic (non-ValueError) error path.
+
+    Always includes the exception's type name. Many httpx network errors --
+    ReadTimeout, ConnectTimeout, ConnectError -- stringify to an empty message when
+    raised without an explicit reason, so "Unexpected error: " alone (str(e) empty)
+    gives the caller nothing to act on; the type name at least says it was a timeout
+    vs. a connection error vs. something else.
+    """
+    detail = str(exc)
+    return f"Unexpected error: {type(exc).__name__}" + (f": {detail}" if detail else "")
+
+
 def _default_if_none(value: Any, default: Any) -> Any:
     """Map an explicit `None` back to `default`, so a caller sending JSON `null` for a
     parameter behaves exactly like omitting it -- Python only applies a function's own
@@ -1077,7 +1090,7 @@ async def search_articles(
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
 @mcp.tool(output_schema=None)
@@ -1300,7 +1313,7 @@ async def get_latest_headlines(
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
 @mcp.tool(output_schema=None)
@@ -1436,7 +1449,7 @@ async def get_breaking_news(
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
 @mcp.tool(output_schema=None)
@@ -1627,7 +1640,7 @@ async def search_by_author(
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
 @mcp.tool(output_schema=None)
@@ -1701,7 +1714,7 @@ async def search_by_link(
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
 @mcp.tool(output_schema=None)
@@ -1810,7 +1823,7 @@ async def list_sources(
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
 @mcp.tool(output_schema=None)
@@ -2015,7 +2028,7 @@ async def get_aggregation_count(
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
 @mcp.tool(output_schema=None)
@@ -2044,7 +2057,7 @@ async def get_subscription(api_token: str = "") -> str:
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        return _format_unexpected_error(e)
 
 
 @mcp.tool(output_schema=None)

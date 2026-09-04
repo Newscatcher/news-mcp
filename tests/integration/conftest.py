@@ -59,5 +59,9 @@ def call_result_text(result) -> str:
 def call_result_json(result) -> dict:
     """Extract, print, and parse JSON from a CallToolResult."""
     text = call_result_text(result)
-    assert not text.startswith("Error:"), f"Tool returned error: {text}"
+    # A tool has two error-return prefixes: "Error: " (ValueError -- validation/API
+    # errors) and "Unexpected error: " (anything else, e.g. a network timeout talking
+    # to the upstream API). Assert on both so a real failure here shows its message
+    # directly instead of a confusing JSONDecodeError from parsing prose as JSON.
+    assert not text.startswith(("Error:", "Unexpected error:")), f"Tool returned error: {text}"
     return json.loads(text)
