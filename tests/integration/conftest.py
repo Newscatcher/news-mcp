@@ -17,7 +17,7 @@ import os
 
 import pytest
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
 # Defaults to localhost so tests "just work" against a locally started server
 # with zero extra config. Point MCP_SERVER_URL at
@@ -36,10 +36,11 @@ async def mcp():
     print(f"\nRunning tests against: {SERVER_URL}\n")
     headers = {"x-api-token": API_KEY} if API_KEY else {}
     try:
-        async with streamablehttp_client(SERVER_URL, headers=headers) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                yield session
+        async with create_mcp_http_client(headers=headers) as http_client:
+            async with streamable_http_client(SERVER_URL, http_client=http_client) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    yield session
     except* RuntimeError as eg:
         # Suppress the anyio cancel-scope teardown bug in pytest-asyncio.
         # All actual test assertions have already run at this point.
