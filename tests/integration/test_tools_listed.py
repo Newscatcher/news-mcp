@@ -48,7 +48,7 @@ async def test_search_articles_has_required_params(mcp):
     result = await mcp.list_tools()
     tool = next((t for t in result.tools if t.name == "search_articles"), None)
     assert tool is not None, "search_articles not found"
-    schema = tool.inputSchema
+    schema = tool.input_schema
     assert "q" in schema.get("properties", {}), "search_articles missing 'q' param"
     assert "q" in schema.get("required", []), "search_articles 'q' should be required"
 
@@ -58,7 +58,7 @@ async def test_search_by_author_has_required_params(mcp):
     result = await mcp.list_tools()
     tool = next((t for t in result.tools if t.name == "search_by_author"), None)
     assert tool is not None, "search_by_author not found"
-    assert "author_name" in tool.inputSchema.get("required", []), (
+    assert "author_name" in tool.input_schema.get("required", []), (
         "search_by_author 'author_name' should be required"
     )
 
@@ -71,7 +71,7 @@ async def test_search_by_link_ids_and_links_are_optional_at_schema_level(mcp):
     result = await mcp.list_tools()
     tool = next((t for t in result.tools if t.name == "search_by_link"), None)
     assert tool is not None, "search_by_link not found"
-    props = tool.inputSchema.get("properties", {})
+    props = tool.input_schema.get("properties", {})
     assert {"ids", "links"} <= set(props)
 
 
@@ -82,4 +82,4 @@ async def test_get_subscription_and_check_health_have_no_required_params(mcp):
     for name in ("get_subscription", "check_health"):
         tool = tools.get(name)
         assert tool is not None, f"{name} not found"
-        assert not tool.inputSchema.get("required"), f"{name} should have no required params"
+        assert not tool.input_schema.get("required"), f"{name} should have no required params"
