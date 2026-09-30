@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.10] — 2026-09-30
+
+### Fixed
+- **PostHog analytics silently stopped sending any events after the fastmcp
+  3.3.1 → 4.0.5 upgrade (`requirements.txt`, 2f9f8dd).** That upgrade also bumped `mcp`
+  1.28.1 → 2.2.0, but `posthog==7.39.1` predates that SDK's support for MCP SDK v2 /
+  standalone FastMCP 4 -- `posthog.mcp.instrument()` at that version raises `ImportError`
+  as soon as it sees `mcp>=2` installed (fixed upstream in `posthog==7.40.0`, released one
+  day after `7.39.1`; a further "missing MCP analytics events with standalone FastMCP 4"
+  bug was fixed in `7.52.1`).
+  - `_init_analytics()`'s own `except Exception` (`server.py`, added defensively so
+    analytics can never take the server down) swallowed that `ImportError`, logged it as a
+    `logger.warning`, and returned `None` -- so the server kept serving normally with
+    `_posthog_client = None` and `_AnalyticsFlushMiddleware` never attached. No crash, no
+    loud failure, just zero events reaching PostHog.
+  - Fixed by bumping `posthog` to `7.60.2` in `requirements.txt`, well past both fixes.
+  - No existing test exercised `_init_analytics()` succeeding when a project key is
+    configured, which is why this shipped unnoticed -- the local dev `.venv` was also
+    still on the pre-upgrade `fastmcp==3.3.1`/`mcp==1.28.1` with `posthog` not installed
+    at all, so `instrument()` was never actually exercised against the new SDK versions
+    before merge.
+
 ## [0.4.9] — 2026-09-04
 
 ### Changed

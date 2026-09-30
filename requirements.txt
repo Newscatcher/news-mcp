@@ -2,4 +2,4 @@ cryptography==50.0.0
 fastmcp==4.0.5
 httpx==0.28.1
 mcp==2.2.0
-posthog==7.39.1
+posthog==7.60.2
