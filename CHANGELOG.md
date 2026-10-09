@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.11] — 2026-10-09
+
+### Added
+- **`more_results` block on `search_articles`/`get_latest_headlines`, plus an
+  "ask before fetching more" rule for the model.** With the defaults
+  (`page_size=50`, clustered, top 3 per cluster) a broad query silently stops at
+  page 1: "Aramco" matches 10,000+ articles, the call pulls 50, 48 of them are
+  one story, and Claude sees 8 articles in 4 clusters with no signal that the
+  rest exist. Now, whenever the query matched more than the call pulled, the
+  response carries
+  `more_results: {total_hits, total_hits_capped, fetched, clusters_shown,
+  articles_shown, next_call, ask_user}`, e.g. live on prod data:
+  `{"total_hits": 10000, "total_hits_capped": true, "fetched": 200,
+  "clusters_shown": 11, "articles_shown": 19, "next_call": {"page_size": 1000},
+  "ask_user": "Looked at the top 200 of 10,000+ matching articles (11 stories). Pull more?"}`.
+  - New "More results: ask before fetching more" section in the server
+    instructions (and both tools' Returns): answer first, then tell the user how
+    much is left and ask; never fetch more unprompted; on a yes, repeat the call
+    with `next_call` merged in. A user who asked for full coverage up front has
+    already said yes.
+  - `next_call` for clustered results steps `page_size` 50 → 200 → 1000 before
+    moving to `page=2` (`MORE_RESULTS_PAGE_SIZE_STEPS`), because clustering runs
+    one page at a time: a bigger page brings in new stories, page 2 of a small
+    page mostly repeats page 1's biggest story. Flat lists just page.
+  - `fetched` is read before `_cap_response_size` (sum of `cluster_size`, which
+    the per-cluster trim never touches); `clusters_shown`/`articles_shown` after
+    it, so they match what is actually in the response.
+  - Omitted when the call already pulled every retrievable match (`total_hits`,
+    capped at 10,000, reached) or the response has no `total_hits`/articles.
+  - Defaults are unchanged: page 1 stays as cheap as before, the user decides
+    whether the bigger (and slower, ~25s at `page_size=1000`) pull is worth it.
+
+### Tests
+- New `MoreResultsTests`: default clustered coverage + ask text, the
+  200 → 1000 → page 2 → page 3 ladder, flat lists paging, absent when everything
+  was pulled or on the last retrievable page, absent without `total_hits`,
+  applies to `get_latest_headlines`, not added to other tools, shown counts
+  reflect the response-size cap.
+
+---
+
 ## [0.4.10] — 2026-09-30
 
 ### Fixed

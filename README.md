@@ -309,6 +309,17 @@ returned article/story content *are* captured in `$mcp_parameters` and `$mcp_res
   30s — a `408` means narrow the query, shorten the date range, or lower `page_size`.
   Clustering operates one page at a time, so raise `page_size` to at least your
   expected result count for coherent clusters.
+- **More results: ask before fetching more.** When a `search_articles`/
+  `get_latest_headlines` query matched more articles than the call pulled, the
+  response carries a `more_results` block: `total_hits`, `total_hits_capped`
+  (`total_hits` is the 10,000 ceiling, real count is higher), `fetched`,
+  `clusters_shown`/`articles_shown`, `next_call` and a ready-made `ask_user`
+  question. The model answers first, then tells the user how much is left and asks
+  before fetching more; on a yes it repeats the call with `next_call` merged in.
+  For clustered results `next_call` steps `page_size` up (50 → 200 → 1000) before
+  moving to `page=2`, since a bigger page brings in new stories while page 2 of a
+  small page mostly repeats the biggest one. Flat lists just move to the next page.
+  No block means the call already pulled every retrievable match.
 - **Historical data.** Data is indexed monthly and goes back to 2019; NLP
   enrichment only covers articles indexed from July 2023 onward (earlier articles
   still return an `nlp` object, just empty `{}` — use `has_nlp=true` to filter to
