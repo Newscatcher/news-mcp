@@ -230,6 +230,21 @@ translation fields to each article). `search_articles` additionally defaults `cl
 - Call `get_aggregation_count` first on any broad/undated query to gauge volume before paginating a `search_articles` call.
 - Server-side request timeout is 30s; a `408` means: narrow the query, shorten the date range, or reduce `page_size`.
 
+## More results: ask before fetching more
+- `search_articles`/`get_latest_headlines` add a `more_results` block whenever the query matched more
+  articles than the call pulled: `total_hits`, `total_hits_capped` (true when `total_hits` is the
+  10,000 ceiling, so the real count is higher), `fetched` (articles this call pulled from the API),
+  `clusters_shown`/`articles_shown` (what is actually in the response after the per-cluster cap),
+  `next_call` (the exact parameter changes for the next fetch), and `ask_user` (a ready-made question).
+- When it's present and a person is in the conversation: answer from what you have first, then tell
+  them how much is left (`ask_user`, or your own words with the same numbers) and ask whether to
+  fetch more. Don't fetch more on your own; on a yes, repeat the same call with `next_call` merged in.
+  If the user already asked for everything / full coverage up front, that counts as the yes.
+- `next_call` steps `page_size` up (50 -> 200 -> 1000) before moving to `page=2`, because clustering
+  runs one page at a time: a bigger page brings in new stories, while page 2 of a small page mostly
+  repeats page 1's biggest story. Flat lists (`clustering_enabled=false`) just move to the next page.
+- No `more_results` block means the call already pulled every retrievable match.
+
 ## Historical data and date ranges
 - Data is indexed monthly and goes back to 2019; NLP enrichment is only available for articles indexed
   from July 2023 onward (earlier articles still return an `nlp` object, just empty `{}` — use
@@ -691,9 +706,97 @@ def _cap_response_size(result: Any, max_bytes: int = MAX_RESPONSE_BYTES) -> Any:
     return result
 
 
-def _dump_capped(result: dict) -> str:
-    """Serialize a tool's result dict, applying the response-size cap first."""
-    return json.dumps(_cap_response_size(result))
+# News API never returns more than this many articles for one query, however you page.
+MAX_RETRIEVABLE_HITS = 10_000
+
+# page_size steps for a clustered "pull more". Clustering runs one page at a time, so a
+# bigger page re-clusters everything together and brings in new stories, while page 2 of
+# a small page mostly repeats the biggest story from page 1. Step page_size up through
+# these first, then move to page 2+ at the largest size.
+MORE_RESULTS_PAGE_SIZE_STEPS = (200, 1000)
+
+
+def _fetched_count(result: Any) -> int | None:
+    """How many articles this call actually pulled from News API: the sum of
+    `cluster_size` for a clustered response (per-cluster trimming never touches it),
+    or the length of a flat `articles` list. None for any other shape (errors, etc.).
+    Must be read before _cap_response_size, which drops whole trailing items."""
+    if not isinstance(result, dict):
+        return None
+    clusters = result.get("clusters")
+    if isinstance(clusters, list):
+        return sum(c.get("cluster_size") or 0 for c in clusters if isinstance(c, dict))
+    articles = result.get("articles")
+    if isinstance(articles, list):
+        return len(articles)
+    return None
+
+
+def _more_results(result: dict, page: int, page_size: int, fetched: int) -> dict | None:
+    """Build the `more_results` block for search_articles/get_latest_headlines, or None
+    when this call already pulled every retrievable match (or nothing came back).
+
+    The block tells the model how much of the query it has actually seen and the exact
+    parameter changes for the next fetch, so it can tell the user how much is left and
+    ask before fetching more (see "More results" in the server instructions) instead of
+    either silently stopping at page 1 or paging on its own. `clusters_shown`/
+    `articles_shown` count what is really in the response, so call this on the result
+    AFTER _cap_response_size; `fetched` must come from _fetched_count BEFORE it.
+    """
+    total_hits = result.get("total_hits")
+    if not isinstance(total_hits, int) or fetched <= 0:
+        return None
+    retrievable = min(total_hits, MAX_RETRIEVABLE_HITS)
+    first = (page - 1) * page_size + 1
+    last = (page - 1) * page_size + fetched
+    if last >= retrievable:
+        return None
+
+    clusters = result.get("clusters")
+    clustered = isinstance(clusters, list)
+    shown: dict[str, int] = {}
+    if clustered:
+        shown["clusters_shown"] = len(clusters)
+        shown["articles_shown"] = sum(
+            len(c.get("articles") or []) for c in clusters if isinstance(c, dict)
+        )
+    else:
+        shown["articles_shown"] = len(result.get("articles") or [])
+
+    next_call: dict[str, int] = {"page": page + 1, "page_size": page_size}
+    if clustered and page == 1:
+        bigger = [s for s in MORE_RESULTS_PAGE_SIZE_STEPS if s > page_size]
+        if bigger:
+            next_call = {"page_size": bigger[0]}
+
+    capped = total_hits >= MAX_RETRIEVABLE_HITS
+    total_text = f"{MAX_RETRIEVABLE_HITS:,}+" if capped else f"{total_hits:,}"
+    seen_text = f"the top {last:,}" if page == 1 else f"articles {first:,} to {last:,}"
+    stories = result.get("clusters_count") if clustered else None
+    if clustered and not isinstance(stories, int):
+        stories = len(clusters)
+    stories_text = f" ({stories:,} stories)" if clustered else ""
+    return {
+        "total_hits": total_hits,
+        "total_hits_capped": capped,
+        "fetched": fetched,
+        **shown,
+        "next_call": next_call,
+        "ask_user": f"Looked at {seen_text} of {total_text} matching articles{stories_text}. Pull more?",
+    }
+
+
+def _dump_capped(result: dict, page: int | None = None, page_size: int | None = None) -> str:
+    """Serialize a tool's result dict, applying the response-size cap first. With
+    page/page_size (search_articles/get_latest_headlines), also attach `more_results`
+    when the query matched more than this call returned."""
+    fetched = _fetched_count(result) if page is not None and page_size is not None else None
+    result = _cap_response_size(result)
+    if fetched is not None and isinstance(result, dict):
+        more = _more_results(result, page, page_size, fetched)
+        if more is not None:
+            result["more_results"] = more
+    return json.dumps(result)
 
 
 def build_source(fields: list[str] | None, clustered: bool) -> str | None:
@@ -1006,7 +1109,11 @@ async def search_articles(
         `clusters` (each `{cluster_id, cluster_size, articles}`, `articles` capped
         to `cluster_top_n_articles` per cluster) -- pass clustering_enabled=False
         for a flat `articles` list instead. Also includes `user_input` echoing back
-        the parameters actually applied.
+        the parameters actually applied. When the query matched more articles than
+        this call pulled, also a `more_results` block (`total_hits`,
+        `total_hits_capped`, `fetched`, `clusters_shown`/`articles_shown`,
+        `next_call`, `ask_user`): answer first, then tell the user how much is left
+        and ask before fetching more -- see "More results" in the server instructions.
 
     Common API errors:
         - 401: missing or invalid API token.
@@ -1107,7 +1214,7 @@ async def search_articles(
             result = await make_api_request(api_token=api_token, path="/api/search", json_data=body)
         if clustered:
             result = _trim_cluster_articles(result, cluster_top_n_articles)
-        return _dump_capped(result)
+        return _dump_capped(result, page=page, page_size=page_size)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:
@@ -1255,7 +1362,9 @@ async def get_latest_headlines(
         (by default, since clustering_enabled defaults to True) `clusters_count` +
         `clusters` (each `articles` list capped to `cluster_top_n_articles`)
         instead of a flat `articles` list -- pass clustering_enabled=False for a
-        plain article list.
+        plain article list. When more articles matched than this call pulled, also
+        a `more_results` block -- see search_articles's Returns and "More results"
+        in the server instructions.
 
     Common API errors:
         - 401: missing or invalid API token.
@@ -1330,7 +1439,7 @@ async def get_latest_headlines(
         result = await make_api_request(api_token=api_token, path="/api/latest_headlines", json_data=body)
         if clustered:
             result = _trim_cluster_articles(result, cluster_top_n_articles)
-        return _dump_capped(result)
+        return _dump_capped(result, page=page, page_size=page_size)
     except ValueError as e:
         return f"Error: {str(e)}"
     except Exception as e:

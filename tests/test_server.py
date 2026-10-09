@@ -1115,5 +1115,102 @@ class ResponseSizeCapTests(unittest.TestCase):
         self.assertEqual(out["response_capped"]["kept"], len(out["articles"]))
 
 
+def _clustered(sizes, total_hits=10_000):
+    """A clustered search response with one cluster per entry in `sizes`, each holding
+    `size` articles (so the per-cluster cap has something to trim)."""
+    return {
+        "total_hits": total_hits,
+        "clusters_count": len(sizes),
+        "clusters": [
+            {"cluster_id": f"c{i}", "cluster_size": n, "articles": [{"title": f"a{i}-{j}"} for j in range(n)]}
+            for i, n in enumerate(sizes)
+        ],
+    }
+
+
+class MoreResultsTests(unittest.IsolatedAsyncioTestCase):
+    """`more_results` tells the model how much of the query it has actually seen, so it
+    can tell the user how much is left and ask before fetching more. Present only when
+    the query matched more than the call pulled; clustered results step page_size up
+    before paging, flat results just page."""
+
+    async def _search(self, raw, **kwargs):
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = raw
+            return json.loads(await _unwrap(server.search_articles)(q="Aramco", **kwargs))
+
+    async def test_default_clustered_call_reports_coverage_and_asks(self) -> None:
+        # Dima's Aramco case: 50 articles, 48 of them one story, 10,000+ matches.
+        data = await self._search(_clustered([26, 17, 5, 1, 1]))
+        more = data["more_results"]
+        self.assertEqual(more["total_hits"], 10_000)
+        self.assertTrue(more["total_hits_capped"])
+        self.assertEqual(more["fetched"], 50)
+        self.assertEqual(more["clusters_shown"], 5)
+        self.assertEqual(more["articles_shown"], 3 + 3 + 3 + 1 + 1)  # after the top-3 cap
+        self.assertEqual(more["next_call"], {"page_size": 200})
+        self.assertEqual(
+            more["ask_user"],
+            "Looked at the top 50 of 10,000+ matching articles (5 stories). Pull more?",
+        )
+
+    async def test_clustered_steps_page_size_then_pages(self) -> None:
+        data = await self._search(_clustered([100, 100]), page_size=200)
+        self.assertEqual(data["more_results"]["next_call"], {"page_size": 1000})
+        data = await self._search(_clustered([500, 500]), page_size=1000)
+        self.assertEqual(data["more_results"]["next_call"], {"page": 2, "page_size": 1000})
+        data = await self._search(_clustered([500, 500]), page=2, page_size=1000)
+        self.assertEqual(data["more_results"]["next_call"], {"page": 3, "page_size": 1000})
+        self.assertIn("articles 1,001 to 2,000", data["more_results"]["ask_user"])
+
+    async def test_flat_list_pages_without_stepping_page_size(self) -> None:
+        raw = {"total_hits": 75, "articles": [{"title": f"a{i}"} for i in range(20)]}
+        data = await self._search(raw, clustering_enabled=False, page_size=20)
+        more = data["more_results"]
+        self.assertFalse(more["total_hits_capped"])
+        self.assertEqual(more["fetched"], 20)
+        self.assertEqual(more["articles_shown"], 20)
+        self.assertNotIn("clusters_shown", more)
+        self.assertEqual(more["next_call"], {"page": 2, "page_size": 20})
+        self.assertEqual(more["ask_user"], "Looked at the top 20 of 75 matching articles. Pull more?")
+
+    async def test_absent_when_everything_was_pulled(self) -> None:
+        data = await self._search(_clustered([3, 2], total_hits=5))
+        self.assertNotIn("more_results", data)
+        # Last retrievable page of a capped query: nothing left to fetch.
+        data = await self._search(_clustered([500, 500]), page=10, page_size=1000)
+        self.assertNotIn("more_results", data)
+
+    async def test_absent_without_total_hits_or_articles(self) -> None:
+        data = await self._search({"articles": [{"title": "a"}]}, clustering_enabled=False)
+        self.assertNotIn("more_results", data)
+        data = await self._search({"total_hits": 10_000, "articles": []}, clustering_enabled=False)
+        self.assertNotIn("more_results", data)
+
+    async def test_applies_to_get_latest_headlines(self) -> None:
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = _clustered([30, 20], total_hits=400)
+            data = json.loads(await _unwrap(server.get_latest_headlines)())
+        self.assertEqual(data["more_results"]["next_call"], {"page_size": 200})
+        self.assertFalse(data["more_results"]["total_hits_capped"])
+
+    async def test_not_added_to_other_tools(self) -> None:
+        with patch("server.make_api_request", new_callable=AsyncMock) as mock_api:
+            mock_api.return_value = {"total_hits": 500, "articles": [{"title": "a"}]}
+            data = json.loads(await _unwrap(server.search_by_author)(author_name="Jane Doe"))
+        self.assertNotIn("more_results", data)
+
+    def test_shown_counts_reflect_the_response_cap(self) -> None:
+        """`fetched` is read before the size cap drops whole clusters; the shown counts
+        are read after it, so they match what is actually in the response."""
+        raw = _clustered([10] * 40)
+        fetched = server._fetched_count(raw)
+        capped = server._cap_response_size(server._trim_cluster_articles(raw, 3), max_bytes=1_500)
+        more = server._more_results(capped, page=1, page_size=400, fetched=fetched)
+        self.assertEqual(more["fetched"], 400)
+        self.assertEqual(more["clusters_shown"], len(capped["clusters"]))
+        self.assertLess(more["clusters_shown"], 40)
+
+
 if __name__ == "__main__":
     unittest.main()
