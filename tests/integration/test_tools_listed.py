@@ -44,6 +44,18 @@ async def test_each_tool_has_description(mcp):
 
 
 @pytest.mark.asyncio
+async def test_each_tool_is_annotated_read_only(mcp):
+    """Every tool only reads from News API. Without readOnlyHint/destructiveHint in
+    tools/list, MCP clients (e.g. Claude) treat a tool as potentially writing and can
+    prompt for approval on every call regardless of the user's "Always allow" setting."""
+    result = await mcp.list_tools()
+    for tool in result.tools:
+        assert tool.annotations is not None, f"Tool '{tool.name}' has no annotations"
+        assert tool.annotations.read_only_hint is True, f"Tool '{tool.name}' is not marked readOnlyHint=True"
+        assert tool.annotations.destructive_hint is False, f"Tool '{tool.name}' is not marked destructiveHint=False"
+
+
+@pytest.mark.asyncio
 async def test_search_articles_has_required_params(mcp):
     result = await mcp.list_tools()
     tool = next((t for t in result.tools if t.name == "search_articles"), None)
