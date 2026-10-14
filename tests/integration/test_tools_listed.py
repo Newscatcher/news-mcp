@@ -51,8 +51,8 @@ async def test_each_tool_is_annotated_read_only(mcp):
     result = await mcp.list_tools()
     for tool in result.tools:
         assert tool.annotations is not None, f"Tool '{tool.name}' has no annotations"
-        assert tool.annotations.readOnlyHint is True, f"Tool '{tool.name}' is not marked readOnlyHint=True"
-        assert tool.annotations.destructiveHint is False, f"Tool '{tool.name}' is not marked destructiveHint=False"
+        assert tool.annotations.read_only_hint is True, f"Tool '{tool.name}' is not marked readOnlyHint=True"
+        assert tool.annotations.destructive_hint is False, f"Tool '{tool.name}' is not marked destructiveHint=False"
 
 
 @pytest.mark.asyncio
