@@ -317,7 +317,29 @@ hand:
 - `is_headline=true` vs. unfiltered — front-page/top-billed treatment vs. the full set of mentions.
 - Splitting a broad topic across a few `theme` values instead of one unthemed query, when the topic
   plausibly spans multiple themes (e.g. Business and Politics).
-Decide per query, not as a fixed checklist — most requests still just need one well-formed call.""",
+Decide per query, not as a fixed checklist — most requests still just need one well-formed call.
+
+## Giving a client an example of a raw News API request
+If a client asks for an example query/payload they can send directly to the News API (e.g. with
+curl, Postman, or their own HTTP client) rather than through this MCP's tools, build that example
+out of real News API v3 parameters only. Three tool parameters exist only in this MCP server and
+have no equivalent on the API itself -- strip them out (or translate, per below) before presenting
+the example:
+- `api_token` -- not an API parameter at all. The API authenticates via the `x-api-token` request
+  header (or `Authorization: Bearer <token>`), never a body/query field. Show the token as a header
+  in the example, not as a JSON key.
+- `cluster_top_n_articles` -- purely client-side. This server fetches the full clustered response
+  and trims each cluster's `articles` list down to this count itself; the API has no parameter that
+  limits articles per cluster on `/api/search` or `/api/latest_headlines`. Omit it entirely.
+- `fields` -- this server's friendly wrapper around the API's real `_source` parameter. If the
+  example should demonstrate field trimming, translate it to `_source`: a comma-joined string of
+  dotted paths prefixed with `articles.` (or `clusters.articles.` for a clustered request), e.g.
+  `fields=["title","link","nlp.summary"]` becomes `_source=articles.title,articles.link,articles.nlp.summary`.
+  Otherwise just omit it.
+Every other parameter this server exposes maps directly to a real API parameter (occasionally with
+a different shape -- e.g. this server's `custom_tags` dict becomes dotted `custom_tags.<taxonomy>`
+keys, and list-valued params like `search_in`/`theme`/`predefined_sources` become comma-joined
+strings) and can be shown as-is, reshaped the same way the request-building code here does.""",
 )
 
 # Coarse, last-resort backstop behind _cap_response_size (see below): a byte-blind
