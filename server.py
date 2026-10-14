@@ -730,9 +730,14 @@ async def _search_clustered_across_cutoff(api_token: str, body: dict[str, Any]) 
 # output_schema=None, FastMCP auto-wraps that `str` return into structured_content={"result":
 # <same string>} on every response -- a byte-for-byte duplicate of content[0].text, doubling
 # response size for no benefit. output_schema=None suppresses that.
+#
+# Every tool is a read against News API, so each one is annotated readOnlyHint=True /
+# destructiveHint=False. Without these hints MCP clients (e.g. Claude) must assume a tool
+# may write, and can ask for approval on every call even when it is set to "Always allow".
+READ_ONLY_TOOL_ANNOTATIONS: dict[str, bool] = {"readOnlyHint": True, "destructiveHint": False}
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(output_schema=None, annotations=READ_ONLY_TOOL_ANNOTATIONS)
 async def search_articles(
     q: str,
     api_token: str = "",
@@ -1092,7 +1097,7 @@ async def search_articles(
         return _format_unexpected_error(e)
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(output_schema=None, annotations=READ_ONLY_TOOL_ANNOTATIONS)
 async def get_latest_headlines(
     api_token: str = "",
     when: str | None = None,
@@ -1315,7 +1320,7 @@ async def get_latest_headlines(
         return _format_unexpected_error(e)
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(output_schema=None, annotations=READ_ONLY_TOOL_ANNOTATIONS)
 async def get_breaking_news(
     api_token: str = "",
     sort_by: str | None = None,
@@ -1451,7 +1456,7 @@ async def get_breaking_news(
         return _format_unexpected_error(e)
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(output_schema=None, annotations=READ_ONLY_TOOL_ANNOTATIONS)
 async def search_by_author(
     author_name: str,
     api_token: str = "",
@@ -1642,7 +1647,7 @@ async def search_by_author(
         return _format_unexpected_error(e)
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(output_schema=None, annotations=READ_ONLY_TOOL_ANNOTATIONS)
 async def search_by_link(
     api_token: str = "",
     ids: list[str] | None = None,
@@ -1716,7 +1721,7 @@ async def search_by_link(
         return _format_unexpected_error(e)
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(output_schema=None, annotations=READ_ONLY_TOOL_ANNOTATIONS)
 async def list_sources(
     api_token: str = "",
     lang: list[str] | None = None,
@@ -1825,7 +1830,7 @@ async def list_sources(
         return _format_unexpected_error(e)
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(output_schema=None, annotations=READ_ONLY_TOOL_ANNOTATIONS)
 async def get_aggregation_count(
     q: str,
     api_token: str = "",
@@ -2030,7 +2035,7 @@ async def get_aggregation_count(
         return _format_unexpected_error(e)
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(output_schema=None, annotations=READ_ONLY_TOOL_ANNOTATIONS)
 async def get_subscription(api_token: str = "") -> str:
     """
     Check your News API plan, quota, and remaining calls.
@@ -2059,7 +2064,7 @@ async def get_subscription(api_token: str = "") -> str:
         return _format_unexpected_error(e)
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(output_schema=None, annotations=READ_ONLY_TOOL_ANNOTATIONS)
 async def check_health(api_token: str = "") -> str:
     """
     Local liveness ping -- confirms this MCP server process is up and responding.

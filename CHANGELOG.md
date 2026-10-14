@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.10] — 2026-10-14
+
+### Fixed
+- All 9 tools now advertise `readOnlyHint: true` / `destructiveHint: false` in
+  `tools/list` (`READ_ONLY_TOOL_ANNOTATIONS` in `server.py`). Without them, MCP clients
+  such as Claude treated every tool as potentially writing and prompted for approval on
+  nearly every call, even with the connector set to "Always allow".
+
+---
+
 ## [0.4.9] — 2026-09-04
 
 ### Changed
