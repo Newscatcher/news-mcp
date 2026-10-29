@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.4.12] — 2026-10-29
+
+### Security
+- Bumped `fastmcp` 4.0.5 → 4.1.3 in `requirements.txt` and `requirements-test.txt` to
+  resolve Dependabot alerts #7–#10 (both advisories affect `>=4.0.0, <4.1.2`):
+  - Post-transform component authorization was skipped on direct calls.
+  - MCP client wrappers built M2M OAuth providers without issuer binding, letting the
+    client secret be redirected to an attacker-advertised authorization server.
+  - 4.1.3 rather than the latest 4.1.4 because 4.1.4 requires `mcp>=2.3.0`, while this
+    repo pins `mcp==2.2.0`; 4.1.3 accepts `mcp>=2.2.0`, so `mcp` stays untouched.
+
+---
 ## [0.4.11] — 2026-10-14
 
 ### Fixed
